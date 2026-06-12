@@ -1888,6 +1888,20 @@ void MainLoop() {
             }
         }
         LogDebug("Steam user ID: " + g_steamUserId);
+        
+        // Auto-delete remotecache.vdf for patched games to avoid manual user action
+        if (!g_steamPath.empty() && !g_steamUserId.empty() && !g_patchedAppIds.empty()) {
+            for (uint32_t appId : g_patchedAppIds) {
+                fs::path cacheFile = fs::path(g_steamPath) / "userdata" / g_steamUserId / std::to_string(appId) / "remotecache.vdf";
+                if (fs::exists(cacheFile)) {
+                    std::error_code ec;
+                    fs::remove(cacheFile, ec);
+                    if (!ec) {
+                        LogDebug("Auto-cleared remotecache.vdf for AppID " + std::to_string(appId));
+                    }
+                }
+            }
+        }
         std::thread cloudDisablerThread([]() {
             try {
                 while (g_dllRunning) {
