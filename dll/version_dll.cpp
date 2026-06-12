@@ -882,7 +882,7 @@ inline bool PatchVdfContent(std::string& content, const std::set<uint32_t>& trac
                 }
             }
         } else {
-            std::string indent = "\t\t\t\t\t"; // 5 tabs
+            std::string indent = "\t\t\t\t\t";
             std::string newSection = "\n" + indent + "\"" + appIdStr + "\"\n" + indent + "{\n" + indent + "\t\"cloudenabled\"\t\t\"1\"\n" + indent + "\t\"CloudEnabled\"\t\t\"1\"\n" + indent + "}";
             content.insert(appsBracePos + 1, newSection);
             changed = true;
@@ -1206,8 +1206,6 @@ HMODULE WINAPI HookedLoadLibraryExA(LPCSTR lpLibFileName, HANDLE hFile, DWORD dw
     return hMod;
 }
 
-// --- STEAM CLOUD MOCK / SPOOF SYSTEM ---
-
 typedef int32_t HSteamPipe;
 typedef int32_t HSteamUser;
 typedef uint32_t uint32;
@@ -1234,11 +1232,7 @@ enum ERemoteStorageSyncState
 #define VTIDX_IsAppSyncInProgress 69
 #define VTIDX_RunAutoCloudOnAppLaunch 70
 #define VTIDX_RunAutoCloudOnAppExit 71
-
-// Correct vtable index from IClientEngine.h (0-indexed)
 static constexpr int VTIDX_GetIClientRemoteStorage      = 23;
-
-// Debug Logger
 inline void LogDebug(const std::string& msg) {
     try {
         static fs::path logPath;
@@ -1266,9 +1260,6 @@ inline void LogDebug(const std::string& msg) {
         }
     } catch (...) {}
 }
-
-// VTable Hooking Helper - with SEH crash protection
-// SEH wrapper - no C++ objects allowed
 static PROC HookVTableMethodSEH(void* interfacePtr, int methodIndex, PROC hookFunc, DWORD* pExceptionCode) {
     *pExceptionCode = 0;
     __try {
@@ -1307,8 +1298,6 @@ inline PROC HookVTableMethod(void* interfacePtr, int methodIndex, PROC hookFunc)
     }
     return result;
 }
-
-// Function Pointer Typedefs & Original Function Storage
 typedef bool (*IsCloudEnabledForApp_t)(void* self, uint32 nAppId);
 static IsCloudEnabledForApp_t OriginalIsCloudEnabledForApp = nullptr;
 
@@ -1336,8 +1325,6 @@ static ResolveSyncConflict_t OriginalResolveSyncConflict = nullptr;
 static PROC g_originalEvaluateRemoteStorageSyncState = nullptr;
 static PROC g_originalSynchronizeApp = nullptr;
 static std::atomic<bool> g_remoteStorageHooked{false};
-
-// Hooks for IClientRemoteStorage virtual methods
 bool HookedIsCloudEnabledForApp(void* self, uint32 nAppId) {
     bool tracked = IsGameTracked(nAppId);
     LogDebug("IsCloudEnabledForApp called for AppID " + std::to_string(nAppId) + ", tracked=" + (tracked ? "true" : "false"));
@@ -1414,7 +1401,7 @@ void HookedEvaluateRemoteStorageSyncState(void* self, uint32 nAppId, bool bUnk) 
     bool tracked = IsGameTracked(nAppId);
     LogDebug("EvaluateRemoteStorageSyncState called for AppID " + std::to_string(nAppId) + ", tracked=" + (tracked ? "true" : "false"));
     if (tracked) {
-        return; // Suppress backend communication to avoid licensing/handshake errors
+        return;
     }
     if (g_originalEvaluateRemoteStorageSyncState) {
         ((void(*)(void*, uint32, bool))g_originalEvaluateRemoteStorageSyncState)(self, nAppId, bUnk);
@@ -1426,7 +1413,7 @@ bool HookedSynchronizeApp(void* self, uint32 nAppId, bool bSyncClient, bool bSyn
     LogDebug("SynchronizeApp called for AppID " + std::to_string(nAppId) + ", tracked=" + (tracked ? "true" : "false"));
     if (tracked) {
         TriggerLaunchPatch(nAppId);
-        return true; // Pretend sync completed successfully
+        return true;
     }
     if (g_originalSynchronizeApp) {
         return ((bool(*)(void*, uint32, bool, bool))g_originalSynchronizeApp)(self, nAppId, bSyncClient, bSyncServer);
@@ -1438,7 +1425,6 @@ bool HookedGetConflictingFileTimestamps(void* self, uint32 nAppId, uint32* pnTim
     bool tracked = IsGameTracked(nAppId);
     LogDebug("GetConflictingFileTimestamps called for AppID " + std::to_string(nAppId) + ", tracked=" + (tracked ? "true" : "false"));
     if (tracked) {
-        // No conflicts - timestamps match
         if (pnTimestampLocal) *pnTimestampLocal = 0;
         if (pnTimestampRemote) *pnTimestampRemote = 0;
         return false;
@@ -1453,25 +1439,20 @@ bool HookedResolveSyncConflict(void* self, uint32 nAppId, bool bAcceptLocalFiles
     bool tracked = IsGameTracked(nAppId);
     LogDebug("ResolveSyncConflict called for AppID " + std::to_string(nAppId) + ", tracked=" + (tracked ? "true" : "false"));
     if (tracked) {
-        return true; // Conflict resolved (there was none)
+        return true;
     }
     if (OriginalResolveSyncConflict) {
         return OriginalResolveSyncConflict(self, nAppId, bAcceptLocalFiles);
     }
     return true;
 }
-
-// Hooking RemoteStorage & ClientEngine
 static void* g_lastClientRemoteStorage = nullptr;
-
-// SEH wrapper for HookIClientRemoteStorage
 static bool HookIClientRemoteStorageSEH(void* remoteStorage, DWORD* pExceptionCode) {
     *pExceptionCode = 0;
     __try {
-        // Verify pointer is readable
         void** vtable = *(void***)remoteStorage;
-        (void)vtable; // Just test access
-        return true; // Pointer is valid
+        (void)vtable;
+        return true;
     } __except(EXCEPTION_EXECUTE_HANDLER) {
         *pExceptionCode = GetExceptionCode();
         return false;
@@ -1481,8 +1462,6 @@ static bool HookIClientRemoteStorageSEH(void* remoteStorage, DWORD* pExceptionCo
 void HookIClientRemoteStorage(void* remoteStorage) {
     if (!remoteStorage) return;
     if (remoteStorage == g_lastClientRemoteStorage && g_remoteStorageHooked.load()) return;
-    
-    // First verify the pointer is safe to access
     DWORD exCode = 0;
     if (!HookIClientRemoteStorageSEH(remoteStorage, &exCode)) {
         char buf[64];
@@ -1496,8 +1475,6 @@ void HookIClientRemoteStorage(void* remoteStorage) {
     LogDebug("HookIClientRemoteStorage: Hooking IClientRemoteStorage at " + ([](void* p) {
         char buf[32]; sprintf_s(buf, "0x%p", p); return std::string(buf);
     })(remoteStorage));
-    
-    // Use the CORRECT vtable indexes from IClientRemoteStorage.h
     OriginalIsCloudEnabledForApp = (IsCloudEnabledForApp_t)HookVTableMethod(remoteStorage, VTIDX_IsCloudEnabledForApp, (PROC)HookedIsCloudEnabledForApp);
     g_originalEvaluateRemoteStorageSyncState = HookVTableMethod(remoteStorage, VTIDX_EvaluateRemoteStorageSyncState, (PROC)HookedEvaluateRemoteStorageSyncState);
     OriginalGetRemoteStorageSyncState = (GetRemoteStorageSyncState_t)HookVTableMethod(remoteStorage, VTIDX_GetRemoteStorageSyncState, (PROC)HookedGetRemoteStorageSyncState);
@@ -1532,7 +1509,6 @@ void* HookedGetIClientRemoteStorage(void* self, HSteamUser hSteamUser, HSteamPip
 }
 
 static void* g_lastClientEngine = nullptr;
-// SEH wrapper for HookIClientEngine
 static bool HookIClientEngineSEH(void* clientEngine, int vtableIndex, PROC hookFunc, PROC* pOriginal, DWORD* pExceptionCode) {
     *pExceptionCode = 0;
     __try {
@@ -1571,7 +1547,7 @@ static void SafeProactiveGetIClientRemoteStorage(void* clientEngine) {
                     sprintf_s(buf, "SafeProactiveGetIClientRemoteStorage: Got IClientRemoteStorage for %s with pipe=%d user=%d", versions[i], pipe, user);
                     LogDebug(buf);
                     HookIClientRemoteStorage(remoteStorage);
-                    return; // Successfully hooked
+                    return;
                 }
             }
         }
@@ -1591,8 +1567,6 @@ void HookIClientEngine(void* clientEngine) {
         LogDebug("HookIClientEngine: Success! OriginalGetIClientRemoteStorage = " + ([](void* p) {
             char buf[32]; sprintf_s(buf, "0x%p", p); return std::string(buf);
         })((void*)OriginalGetIClientRemoteStorage));
-        
-        // Proactively call GetIClientRemoteStorage ourselves since Steam already called it before our hook
         if (OriginalGetIClientRemoteStorage && !g_remoteStorageHooked.load()) {
             LogDebug("HookIClientEngine: Proactively calling GetIClientRemoteStorage...");
             SafeProactiveGetIClientRemoteStorage(clientEngine);
@@ -1608,8 +1582,6 @@ void HookIClientEngine(void* clientEngine) {
         LogDebug(buf);
     }
 }
-
-// CreateInterface Hook
 typedef void* (*CreateInterface_t)(const char* pName, int* pReturnCode);
 static CreateInterface_t OriginalCreateInterface = nullptr;
 
@@ -1618,8 +1590,6 @@ static HMODULE GetSteamClientModule() {
     if (!h) h = GetModuleHandleA("steamclient.dll");
     return h;
 }
-
-// SEH wrapper for TryDirectRemoteStorageHook
 static void* TryCallCreateInterface(CreateInterface_t fn, const char* name, DWORD* pExceptionCode) {
     *pExceptionCode = 0;
     __try {
@@ -1648,38 +1618,34 @@ void ApplyCloudFixMemoryPatch() {
     DWORD size = modInfo.SizeOfImage;
 
     for (DWORD i = 0; i < size - 17; i++) {
-        // Pattern: test eax, eax; jne ...
         if (base[i] == 0x85 && base[i+1] == 0xC0 &&
             base[i+2] == 0x0F && base[i+3] == 0x85) 
         {
-            // Old STFixer signature: 45 85 FF 0F 84
             if (base[i+8] == 0x45 && base[i+9] == 0x85 && base[i+10] == 0xFF &&
                 base[i+11] == 0x0F && base[i+12] == 0x84) 
             {
                 DWORD oldProtect;
                 if (VirtualProtect(base + i + 11, 2, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                    base[i+11] = 0x90; // NOP
-                    base[i+12] = 0xE9; // JMP
+                    base[i+11] = 0x90;
+                    base[i+12] = 0xE9;
                     VirtualProtect(base + i + 11, 2, oldProtect, &oldProtect);
                     LogDebug("ApplyCloudFixMemoryPatch: Successfully applied old Cloud Rewrite Skip patch!");
                     g_cloudMemoryPatched = true;
                     return;
                 }
             }
-            // New signature for June 2026 Steam: 40 84 FF 74
             else if (base[i+8] == 0x40 && base[i+9] == 0x84 && base[i+10] == 0xFF &&
                      base[i+11] == 0x74) 
             {
                 DWORD oldProtect;
                 if (VirtualProtect(base + i + 11, 1, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-                    base[i+11] = 0xEB; // Unconditional short JMP
+                    base[i+11] = 0xEB;
                     VirtualProtect(base + i + 11, 1, oldProtect, &oldProtect);
                     LogDebug("ApplyCloudFixMemoryPatch: Successfully applied NEW Cloud Rewrite Skip patch!");
                     g_cloudMemoryPatched = true;
                     return;
                 }
             }
-            // Check if already patched
             else if (base[i+8] == 0x40 && base[i+9] == 0x84 && base[i+10] == 0xFF &&
                      base[i+11] == 0xEB) 
             {
@@ -1693,17 +1659,11 @@ void ApplyCloudFixMemoryPatch() {
 }
 
 void TryDirectRemoteStorageHook() {
-    // Attempt memory patching as the primary fix
     ApplyCloudFixMemoryPatch();
-
-    // Fallback: try to directly call CreateInterface for CLIENTREMOTESTORAGE
     if (g_remoteStorageHooked.load()) return;
-    
-    // If OriginalCreateInterface is not set yet, try to find it from steamclient64.dll
     if (!OriginalCreateInterface) {
         HMODULE hSteamclient = GetSteamClientModule();
         if (hSteamclient) {
-            // Get CreateInterface directly from the module
             FARPROC fn = ::GetProcAddress(hSteamclient, "CreateInterface");
             if (fn) {
                 OriginalCreateInterface = (CreateInterface_t)fn;
@@ -1717,8 +1677,6 @@ void TryDirectRemoteStorageHook() {
     }
 
     LogDebug("TryDirectRemoteStorageHook: Attempting to get IClientRemoteStorage...");
-    
-    // Try CLIENTENGINE
     void* engine = OriginalCreateInterface("CLIENTENGINE_INTERFACE_VERSION005", nullptr);
     if (engine) {
         HookIClientEngine(engine);
@@ -1764,8 +1722,6 @@ static GetProcAddress_t OriginalGetProcAddress = ::GetProcAddress;
 FARPROC WINAPI HookedGetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
     if (OriginalGetProcAddress) {
         FARPROC result = OriginalGetProcAddress(hModule, lpProcName);
-
-        // Check if lpProcName is an ordinal (low 16 bits only) - skip string operations
         if (!lpProcName || ((ULONG_PTR)lpProcName < 0x10000)) {
             return result;
         }
@@ -1790,8 +1746,6 @@ FARPROC WINAPI HookedGetProcAddress(HMODULE hModule, LPCSTR lpProcName) {
     }
     return ::GetProcAddress(hModule, lpProcName);
 }
-
-// --- AutoCloud Blinder ---
 #include <shlwapi.h>
 #pragma comment(lib, "Shlwapi.lib")
 
@@ -1811,15 +1765,11 @@ bool ShouldHideFromSteamCloud(LPCWSTR lpFileName) {
     
     std::wstring path = absPath;
     std::transform(path.begin(), path.end(), path.begin(), ::towlower);
-    
-    // Do not block Steam's own files or userdata (Steamworks Cloud files)
     if (path.find(L"\\steam\\") != std::wstring::npos || 
         path.find(L"\\steamapps\\") != std::wstring::npos ||
         path.find(L"userdata") != std::wstring::npos) {
         return false;
     }
-    
-    // If Steam is looking inside common save locations, blind it
     bool isSaveLoc = (path.find(L"\\appdata\\") != std::wstring::npos) ||
                      (path.find(L"\\documents\\") != std::wstring::npos) ||
                      (path.find(L"\\saved games\\") != std::wstring::npos) ||
@@ -1829,8 +1779,6 @@ bool ShouldHideFromSteamCloud(LPCWSTR lpFileName) {
         LogDebug("Blinded AutoCloud save loc scan: " + std::string(path.begin(), path.end()));
         return true;
     }
-    
-    // Also block if it's explicitly looking for .sav files anywhere outside steam
     if (path.length() >= 4 && path.substr(path.length() - 4) == L".sav") {
         LogDebug("Blinded AutoCloud .sav scan: " + std::string(path.begin(), path.end()));
         return true;
@@ -1854,24 +1802,19 @@ HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInf
     }
     return OriginalFindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
 }
-// -------------------------
 
 void ApplyAllHooks() {
     static std::mutex s_hookMutex;
     static DWORD s_lastApplyTime = 0;
-    
-    // Rate limit: max once per 500ms to prevent log spam
     DWORD now = GetTickCount();
     if (now - s_lastApplyTime < 500) return;
     
     std::unique_lock<std::mutex> lock(s_hookMutex, std::try_to_lock);
-    if (!lock.owns_lock()) return; // Another thread is already applying hooks
+    if (!lock.owns_lock()) return;
     
     s_lastApplyTime = now;
     static int s_applyCount = 0;
     s_applyCount++;
-    
-    // Only log the first few and then every 10th
     if (s_applyCount <= 3 || s_applyCount % 10 == 0) {
         LogDebug("ApplyAllHooks: Round #" + std::to_string(s_applyCount));
     }
@@ -1880,8 +1823,6 @@ void ApplyAllHooks() {
     HookAllModulesIAT("kernelbase.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
     HookAllModulesIAT("api-ms-win-core-libraryloader-l1-1-0.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
     HookAllModulesIAT("api-ms-win-core-libraryloader-l1-2-0.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
-
-    // Blinder hooks for AutoCloud
     MH_CreateHookApiEx(L"kernel32", "FindFirstFileW", &HookedFindFirstFileW, (LPVOID*)&OriginalFindFirstFileW, nullptr);
     MH_CreateHookApiEx(L"kernel32", "FindFirstFileExW", &HookedFindFirstFileExW, (LPVOID*)&OriginalFindFirstFileExW, nullptr);
     
@@ -1947,8 +1888,6 @@ void MainLoop() {
             }
         }
         LogDebug("Steam user ID: " + g_steamUserId);
-
-        // VDF patching thread - keeps cloud enabled for tracked apps
         std::thread cloudDisablerThread([]() {
             try {
                 while (g_dllRunning) {
@@ -1958,25 +1897,19 @@ void MainLoop() {
             } catch (...) {}
         });
         cloudDisablerThread.detach();
-
-        // Registry monitor thread - detects game launches/exits
         std::thread t([]() {
             try {
                 MonitorThread();
             } catch (...) {}
         });
         t.detach();
-        
-        // Delayed fallback: try to hook IClientRemoteStorage directly after Steam finishes initializing
         std::thread fallbackThread([]() {
             try {
-                // Wait for Steam to fully initialize
                 std::this_thread::sleep_for(std::chrono::seconds(8));
                 if (!g_remoteStorageHooked.load()) {
                     LogDebug("Fallback: IClientRemoteStorage not yet hooked, trying direct CreateInterface...");
                     TryDirectRemoteStorageHook();
                 }
-                // Also retry periodically in case of late initialization
                 for (int retry = 0; retry < 10 && g_dllRunning; retry++) {
                     std::this_thread::sleep_for(std::chrono::seconds(5));
                     if (g_remoteStorageHooked.load()) {
