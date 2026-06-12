@@ -1,0 +1,395 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Steam Cloud Patcher — by h1p.dev</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="bg-effects">
+    <div class="bg-gradient-orb bg-orb-1"></div>
+    <div class="bg-gradient-orb bg-orb-2"></div>
+    <div class="bg-gradient-orb bg-orb-3"></div>
+    <canvas id="particles-canvas"></canvas>
+  </div>
+
+  <div id="toast-container" class="toast-container"></div>
+
+  <div id="modal-overlay" class="modal-overlay hidden">
+    <div class="modal-card">
+      <div class="modal-icon" id="modal-icon"></div>
+      <h3 class="modal-title" id="modal-title">Confirm Action</h3>
+      <p class="modal-message" id="modal-message">Are you sure?</p>
+      <div class="modal-actions">
+        <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
+        <button class="btn btn-primary" id="modal-confirm">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <header class="top-bar">
+    <div class="top-bar-left">
+      <div class="logo-group">
+        <div class="logo-icon">
+          <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z" class="icon-cloud"/>
+            <path d="M8 14.5l1.5 1.5 3-3" opacity="0.7"/>
+          </svg>
+        </div>
+        <div class="logo-text">
+          <h1>Steam Cloud Patcher</h1>
+          <span class="logo-version">v1.0.0</span>
+        </div>
+      </div>
+    </div>
+    <div class="top-bar-center">
+      <div class="status-indicator" id="connection-status">
+        <span class="status-dot disconnected" id="status-dot"></span>
+        <span class="status-text" id="status-text">Connecting...</span>
+      </div>
+    </div>
+    <div class="top-bar-right">
+      <button class="icon-btn" id="btn-settings" title="Settings">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+      </button>
+      <button class="icon-btn" id="btn-refresh" title="Refresh All">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="23 4 23 10 17 10"/>
+          <polyline points="1 20 1 14 7 14"/>
+          <path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>
+        </svg>
+      </button>
+      <span class="branding">made by <strong class="branding-glow">h1p.dev</strong></span>
+    </div>
+  </header>
+
+  <section class="steam-info-bar glass-panel" id="steam-info-bar">
+    <div class="info-item">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/>
+      </svg>
+      <span class="info-label">Steam Path:</span>
+      <span class="info-value" id="steam-path">Detecting...</span>
+      <button class="icon-btn-sm" id="btn-edit-path" title="Edit Steam Path">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+        </svg>
+      </button>
+    </div>
+    <div class="info-divider"></div>
+    <div class="info-item">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+        <circle cx="12" cy="7" r="4"/>
+      </svg>
+      <span class="info-label">User:</span>
+      <span class="info-value" id="steam-user">—</span>
+    </div>
+    <div class="info-divider"></div>
+    <div class="info-item">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="2" y="7" width="20" height="14" rx="2" ry="2"/>
+        <path d="M16 7V3a2 2 0 0 0-2-2h-4a2 2 0 0 0-2 2v4"/>
+        <line x1="12" y1="12" x2="12" y2="16"/>
+        <line x1="10" y1="14" x2="14" y2="14"/>
+      </svg>
+      <span class="info-label">Games:</span>
+      <span class="info-badge" id="games-count">0</span>
+    </div>
+    <div class="info-divider"></div>
+    <div class="info-item" style="padding: 0;">
+      <button class="btn btn-warning btn-sm btn-flex" id="btn-restart-steam" title="Restart Steam to apply patches and sync saves" style="padding: 4px 10px; font-size: 0.8rem; height: 26px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M18.36 6.64a9 9 0 1 1-12.73 0M12 2v10"/>
+        </svg>
+        Restart Steam
+      </button>
+    </div>
+  </section>
+
+  <div id="settings-panel" class="settings-panel hidden">
+    <div class="settings-header">
+      <h3>
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        Settings
+      </h3>
+      <button class="icon-btn" id="btn-close-settings">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+    </div>
+    <div class="settings-body">
+      <div class="setting-group">
+        <label class="setting-label">Steam Installation Path</label>
+        <div class="setting-input-group">
+          <input type="text" class="input" id="settings-steam-path" placeholder="C:\Program Files (x86)\Steam">
+          <button class="btn btn-primary btn-sm" id="btn-save-steam-path">Save</button>
+        </div>
+        <p class="setting-hint">Override the auto-detected Steam installation path</p>
+      </div>
+      <div class="setting-group">
+        <label class="setting-label">Auto-refresh Interval</label>
+        <select class="input select" id="settings-refresh-interval">
+          <option value="0">Disabled</option>
+          <option value="30">30 seconds</option>
+          <option value="60" selected>1 minute</option>
+          <option value="300">5 minutes</option>
+        </select>
+      </div>
+      <div class="setting-group">
+        <label class="setting-label">Notifications</label>
+        <label class="toggle-label">
+          <input type="checkbox" id="settings-notifications" checked>
+          <span class="toggle-switch"></span>
+          Show toast notifications
+        </label>
+      </div>
+      <div class="setting-group">
+        <label class="setting-label">Automatic Patching (Auto-Patcher)</label>
+        <label class="toggle-label">
+          <input type="checkbox" id="settings-autopatch">
+          <span class="toggle-switch"></span>
+          Auto-patch games reactively
+        </label>
+        <p class="setting-hint">Automatically patches games on launch, exit, or installation using the default provider</p>
+      </div>
+      <div class="setting-group">
+        <label class="setting-label">Default Cloud Provider</label>
+        <select class="input select" id="settings-default-provider">
+          <option value="">None / Manual</option>
+          <option value="gdrive">Google Drive</option>
+          <option value="onedrive">OneDrive</option>
+          <option value="local">Local Folder</option>
+        </select>
+      </div>
+      <div class="setting-group" id="settings-custom-path-group" style="display: none;">
+        <label class="setting-label">Custom Local Folder Path</label>
+        <input type="text" class="input" id="settings-custom-path" placeholder="D:\BackupSaves">
+      </div>
+      <div class="setting-group">
+        <label class="setting-label">Save File Backups</label>
+        <label class="toggle-label">
+          <input type="checkbox" id="settings-enable-backup">
+          <span class="toggle-switch"></span>
+          Enable local backup before syncing
+        </label>
+      </div>
+      <div class="setting-group" id="settings-backup-path-group" style="display: none;">
+        <label class="setting-label">Backup Location Path</label>
+        <input type="text" class="input" id="settings-backup-path" placeholder="C:\SaveBackups">
+      </div>
+    </div>
+  </div>
+
+  <main class="main-content">
+    <section class="section providers-section" id="providers-section">
+      <div class="section-header">
+        <h2 class="section-title">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M18 10h-1.26A8 8 0 1 0 9 20h9a5 5 0 0 0 0-10z"/>
+          </svg>
+          Cloud Providers
+        </h2>
+      </div>
+      <div class="providers-grid" id="providers-grid">
+        <div class="provider-card glass-card" data-provider="gdrive">
+          <div class="provider-card-border"></div>
+          <div class="provider-icon gdrive-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+              <path d="M8.25 2.75L1.5 14.5h6.75L15 2.75H8.25z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M15 2.75l6.75 11.75H15L8.25 2.75" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M1.5 14.5l3.375 5.75h14.25L22.5 14.5H1.5z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <div class="provider-info">
+            <h3>Google Drive</h3>
+            <div class="provider-status">
+              <span class="status-dot-sm" id="gdrive-status-dot"></span>
+              <span class="provider-status-text" id="gdrive-status-text">Checking...</span>
+            </div>
+            <p class="provider-path" id="gdrive-path" title="">—</p>
+          </div>
+        </div>
+
+        <div class="provider-card glass-card" data-provider="onedrive">
+          <div class="provider-card-border"></div>
+          <div class="provider-icon onedrive-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none">
+              <path d="M10 18H4a4 4 0 0 1-.83-7.91A5.002 5.002 0 0 1 13 7a5 5 0 0 1 4.9 4.1A3.5 3.5 0 0 1 17.5 18H10z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+              <path d="M14.5 18h5a3 3 0 0 0 .5-5.96A6 6 0 0 0 9.4 9.2" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            </svg>
+          </div>
+          <div class="provider-info">
+            <h3>OneDrive</h3>
+            <div class="provider-status">
+              <span class="status-dot-sm" id="onedrive-status-dot"></span>
+              <span class="provider-status-text" id="onedrive-status-text">Checking...</span>
+            </div>
+            <p class="provider-path" id="onedrive-path" title="">—</p>
+          </div>
+        </div>
+
+        <div class="provider-card glass-card" data-provider="local">
+          <div class="provider-card-border"></div>
+          <div class="provider-icon local-icon">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="22" y1="12" x2="2" y2="12"/>
+              <path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>
+              <line x1="6" y1="16" x2="6.01" y2="16"/>
+              <line x1="10" y1="16" x2="10.01" y2="16"/>
+            </svg>
+          </div>
+          <div class="provider-info">
+            <h3>Local Folder</h3>
+            <div class="provider-status">
+              <span class="status-dot-sm" id="local-status-dot"></span>
+              <span class="provider-status-text" id="local-status-text">Checking...</span>
+            </div>
+            <p class="provider-path" id="local-path" title="">—</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section games-section" id="games-section">
+      <div class="section-header">
+        <h2 class="section-title">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="6" y1="3" x2="6" y2="15"/>
+            <circle cx="18" cy="6" r="3"/>
+            <circle cx="6" cy="18" r="3"/>
+            <path d="M18 9a9 9 0 0 1-9 9"/>
+          </svg>
+          Supported Games
+          <span class="count-badge" id="games-section-count">0</span>
+        </h2>
+        <div class="section-actions" style="display: flex; gap: 8px;">
+          <button class="btn btn-warning btn-sm btn-flex" id="btn-fix-all-sync" title="Reset Steam Cloud cache and touch files for all patched games">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21.5 2v6h-6M21.34 15.57a10 10 0 1 1-.57-8.38l5.67-5.67"/>
+            </svg>
+            Fix Cloud Sync
+          </button>
+          <button class="btn btn-ghost btn-sm" id="btn-patch-all" title="Patch all games">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+            </svg>
+            Patch All
+          </button>
+        </div>
+      </div>
+
+      <div class="games-toolbar">
+        <div class="filter-tabs" id="filter-tabs">
+          <button class="filter-tab active" data-filter="all">All</button>
+          <button class="filter-tab" data-filter="installed">Installed</button>
+          <button class="filter-tab" data-filter="patched">Patched</button>
+        </div>
+        <div class="search-box">
+          <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="11" cy="11" r="8"/>
+            <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+          </svg>
+          <input type="text" class="search-input" id="search-input" placeholder="Search games...">
+        </div>
+      </div>
+
+      <div class="games-grid" id="games-grid">
+        <div class="game-card skeleton-card">
+          <div class="skeleton skeleton-title"></div>
+          <div class="skeleton skeleton-text"></div>
+          <div class="skeleton skeleton-text short"></div>
+          <div class="skeleton skeleton-btn"></div>
+        </div>
+        <div class="game-card skeleton-card">
+          <div class="skeleton skeleton-title"></div>
+          <div class="skeleton skeleton-text"></div>
+          <div class="skeleton skeleton-text short"></div>
+          <div class="skeleton skeleton-btn"></div>
+        </div>
+        <div class="game-card skeleton-card">
+          <div class="skeleton skeleton-title"></div>
+          <div class="skeleton skeleton-text"></div>
+          <div class="skeleton skeleton-text short"></div>
+          <div class="skeleton skeleton-btn"></div>
+        </div>
+      </div>
+
+      <div class="empty-state hidden" id="empty-state">
+        <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" opacity="0.3">
+          <circle cx="11" cy="11" r="8"/>
+          <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+        </svg>
+        <p>No games found matching your criteria.</p>
+      </div>
+    </section>
+
+    <section class="section backups-section" id="backups-section">
+      <div class="section-header collapsible" id="backups-header">
+        <h2 class="section-title">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          Backups
+          <span class="count-badge" id="backups-count">0</span>
+        </h2>
+        <svg class="collapse-chevron" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="6 9 12 15 18 9"/>
+        </svg>
+      </div>
+      <div class="section-body collapsible-body" id="backups-body">
+        <div class="backups-table-wrapper">
+          <table class="backups-table" id="backups-table">
+            <thead>
+              <tr>
+                <th>Game</th>
+                <th>Date</th>
+                <th>Path</th>
+                <th>Action</th>
+              </tr>
+            </thead>
+            <tbody id="backups-tbody">
+              <tr class="empty-row">
+                <td colspan="4">No backups found.</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="footer-left">
+      <span>Steam Cloud Patcher v1.0.0</span>
+    </div>
+    <div class="footer-center">
+      <span class="footer-branding">made by <strong class="gradient-text">h1p.dev</strong></span>
+    </div>
+    <div class="footer-right">
+      <a href="#" class="footer-link" title="GitHub">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor">
+          <path d="M12 0C5.37 0 0 5.37 0 12c0 5.3 3.438 9.8 8.205 11.387.6.113.82-.258.82-.577 0-.285-.01-1.04-.015-2.04-3.338.724-4.042-1.61-4.042-1.61-.546-1.387-1.333-1.756-1.333-1.756-1.09-.745.083-.73.083-.73 1.205.085 1.84 1.237 1.84 1.237 1.07 1.834 2.807 1.304 3.492.997.108-.776.42-1.305.763-1.605-2.665-.3-5.467-1.332-5.467-5.93 0-1.31.468-2.38 1.235-3.22-.135-.303-.54-1.523.105-3.176 0 0 1.005-.322 3.3 1.23.96-.267 1.98-.399 3-.405 1.02.006 2.04.138 3 .405 2.28-1.552 3.285-1.23 3.285-1.23.645 1.653.24 2.873.12 3.176.765.84 1.23 1.91 1.23 3.22 0 4.61-2.805 5.625-5.475 5.92.42.36.81 1.096.81 2.22 0 1.605-.015 2.896-.015 3.286 0 .315.21.69.825.57C20.565 21.795 24 17.295 24 12c0-6.63-5.37-12-12-12z"/>
+        </svg>
+      </a>
+    </div>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>
