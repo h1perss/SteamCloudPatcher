@@ -31,12 +31,7 @@ The patcher proactively clears the `remotecache.vdf` for managed games to preven
 2. Completely close Steam (Ensure `steam.exe` and `steamwebhelper.exe` are not running in the background).
 3. Navigate to your Steam installation directory (usually `C:\Program Files (x86)\Steam\`).
 4. Paste the downloaded `version.dll` into the folder.
-5. Launch Steam! The patcher will automatically initialize in the background.
-
-### ⚠️ Troubleshooting (If you still see a sync error)
-If you install this fix for a game that you have **already played with Cloud Sync enabled**, Steam might have the old error state stuck in its cache. To fix this:
-1. Launch the game once and close it. The patcher will automatically try to clear the cache.
-2. **If it still persists:** Close Steam completely, then go to `C:\Program Files (x86)\Steam\userdata\<YourID>\<AppID>\` and delete the **`remotecache.vdf`** file. Restart Steam, and the Green Tick will appear permanently.
+5. Launch Steam! The patcher will automatically initialize in the background and seamlessly clear old cache files for patched games.
 
 ## ⚙️ Configuration
 
