@@ -1765,23 +1765,52 @@ bool ShouldHideFromSteamCloud(LPCWSTR lpFileName) {
     
     std::wstring path = absPath;
     std::transform(path.begin(), path.end(), path.begin(), ::towlower);
-    if (path.find(L"\\steam\\") != std::wstring::npos || 
-        path.find(L"\\steamapps\\") != std::wstring::npos ||
-        path.find(L"userdata") != std::wstring::npos) {
+    
+    // EXCEPTION: Always allow Steam's own core directories so Steam doesn't break
+    // We allow \steam\ and \steamapps\ explicitly, but we will override this exception for save folders below.
+    bool isSteamDir = (path.find(L"\\steam\\") != std::wstring::npos) || 
+                      (path.find(L"\\steamapps\\") != std::wstring::npos);
+                      
+    // EXCEPTION: Always allow Steam userdata (where Steam caches cloud states)
+    if (path.find(L"\\steam\\userdata") != std::wstring::npos || path.find(L"\\program files (x86)\\steam\\userdata") != std::wstring::npos) {
         return false;
     }
-    bool isSaveLoc = (path.find(L"\\appdata\\") != std::wstring::npos) ||
+    
+    // UNIVERSAL SAVE LOCATION BLINDER
+    // We blind all standard Windows user directories where games are forced to save
+    bool isUserLoc = (path.find(L"\\appdata\\") != std::wstring::npos) ||
                      (path.find(L"\\documents\\") != std::wstring::npos) ||
                      (path.find(L"\\saved games\\") != std::wstring::npos) ||
-                     (path.find(L"\\my games\\") != std::wstring::npos);
+                     (path.find(L"\\my games\\") != std::wstring::npos) ||
+                     (path.find(L"\\programdata\\") != std::wstring::npos) ||
+                     (path.find(L"\\users\\public\\") != std::wstring::npos);
                      
-    if (isSaveLoc) {
-        LogDebug("Blinded AutoCloud save loc scan: " + std::string(path.begin(), path.end()));
+    // We aggressively blind ANY path that specifically targets a "save" folder, even if it's inside steamapps!
+    // This catches games that save inside their own installation folders.
+    bool isSaveKeyword = (path.find(L"\\saves\\") != std::wstring::npos) ||
+                         (path.find(L"\\save\\") != std::wstring::npos) ||
+                         (path.find(L"\\savegames\\") != std::wstring::npos) ||
+                         (path.find(L"\\save_games\\") != std::wstring::npos) ||
+                         (path.find(L"\\saved\\") != std::wstring::npos);
+                         
+    if (isUserLoc || isSaveKeyword) {
+        // If it's a known user loc or save keyword, we blind it to protect against AutoCloud!
+        LogDebug("Blinded Universal AutoCloud scan: " + std::string(path.begin(), path.end()));
         return true;
     }
-    if (path.length() >= 4 && path.substr(path.length() - 4) == L".sav") {
-        LogDebug("Blinded AutoCloud .sav scan: " + std::string(path.begin(), path.end()));
-        return true;
+    
+    // If it's inside Steam and didn't trigger the save keywords above, it's safe (e.g. game verification, updates)
+    if (isSteamDir) {
+        return false;
+    }
+    
+    // Also universally block if Steam is explicitly scanning for common save extensions anywhere
+    if (path.length() >= 4) {
+        std::wstring ext = path.substr(path.length() - 4);
+        if (ext == L".sav" || ext == L".bak" || ext == L".dat") {
+            LogDebug("Blinded AutoCloud extension scan: " + std::string(path.begin(), path.end()));
+            return true;
+        }
     }
     
     return false;
