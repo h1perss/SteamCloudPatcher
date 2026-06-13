@@ -616,7 +616,7 @@ inline bool IsManifestSpoofed(uint32_t appId, const std::string& steamPath, cons
 inline bool IsSteamToolsSpoofed(uint32_t appId, const std::string& steamPath) {
     std::string appIdStr = std::to_string(appId);
     fs::path configDir = fs::path(steamPath) / "config";
-    std::vector<fs::path> dirsToCheck = { configDir / "stplugin", configDir / "lua", configDir / "stplugin" / "lua" };
+    std::vector<fs::path> dirsToCheck = { configDir / "stplug-in", configDir / "lua", configDir / "stplug-in" / "lua" };
     
     for (const auto& dir : dirsToCheck) {
         if (fs::exists(dir) && fs::is_directory(dir)) {
