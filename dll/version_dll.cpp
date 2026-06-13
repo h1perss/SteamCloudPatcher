@@ -1755,14 +1755,38 @@ typedef HANDLE(WINAPI* FindFirstFileExW_t)(LPCWSTR lpFileName, FINDEX_INFO_LEVEL
 static FindFirstFileW_t OriginalFindFirstFileW = nullptr;
 static FindFirstFileExW_t OriginalFindFirstFileExW = nullptr;
 
+typedef BOOL(WINAPI* WriteFile_t)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
+static WriteFile_t OriginalWriteFile = nullptr;
+
+thread_local uint32_t t_currentAppId = 0;
+
+BOOL WINAPI HookedWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped) {
+    if (lpBuffer && nNumberOfBytesToWrite > 15) {
+        const char* buf = (const char*)lpBuffer;
+        // Optimization: Steam logs usually start with '[' (e.g. "[2026-06-12...")
+        if (buf[0] == '[') {
+            const char* appIdStr = strstr(buf, "[AppID ");
+            if (appIdStr) {
+                t_currentAppId = (uint32_t)atoi(appIdStr + 7);
+            }
+        }
+    }
+    return OriginalWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+}
+
 bool ShouldHideFromSteamCloud(LPCWSTR lpFileName) {
-    if (!lpFileName) return false;
+    if (!lpFileName || g_patchedAppIds.empty()) return false;
     
+    // IF THIS THREAD IS NOT LOGGING ABOUT A PATCHED APPID, ALLOW EVERYTHING (Fixes CS2 and legit games losing saves)
+    if (t_currentAppId == 0 || g_patchedAppIds.find(t_currentAppId) == g_patchedAppIds.end()) {
+        return false;
+    }
+
     wchar_t absPath[MAX_PATH];
     if (GetFullPathNameW(lpFileName, MAX_PATH, absPath, nullptr) == 0) {
         wcscpy_s(absPath, MAX_PATH, lpFileName);
     }
-    
+
     std::wstring path = absPath;
     std::transform(path.begin(), path.end(), path.begin(), ::towlower);
     
@@ -1862,6 +1886,7 @@ void ApplyAllHooks() {
     HookAllModulesIAT("kernel32.dll", "CreateFileW", (PROC)HookedCreateFileW, (PROC*)&OriginalCreateFileW);
     HookAllModulesIAT("kernel32.dll", "CreateFileA", (PROC)HookedCreateFileA, (PROC*)&OriginalCreateFileA);
     HookAllModulesIAT("kernel32.dll", "CloseHandle", (PROC)HookedCloseHandle, (PROC*)&OriginalCloseHandle);
+    HookAllModulesIAT("kernel32.dll", "WriteFile", (PROC)HookedWriteFile, (PROC*)&OriginalWriteFile);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryW", (PROC)HookedLoadLibraryW, (PROC*)&OriginalLoadLibraryW);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryExW", (PROC)HookedLoadLibraryExW, (PROC*)&OriginalLoadLibraryExW);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryA", (PROC)HookedLoadLibraryA, (PROC*)&OriginalLoadLibraryA);
