@@ -7,6 +7,7 @@ A lightweight, robust proxy DLL (`version.dll`) designed to permanently fix Stea
 *   **Green Tick Guarantee**: Completely bypasses the annoying yellow exclamation mark ("Cloud Sync Error") in the Steam UI.
 *   **AutoCloud Blinder**: Intercepts Steam's internal file system scanners to prevent unauthorized sync attempts.
 *   **Memory Patching**: Dynamically patches `steamclient64.dll` at runtime to skip Cloud Rewrite Error evaluations.
+*   **Intelligent Auto-Detect**: No manual configuration required! The patcher monitors Steam's internal logs and instantly patches any game that triggers an "Access Denied" error, applying the fix completely automatically.
 *   **Local Save Redirection**: Safely backs up your actual save files to a unified location (e.g., OneDrive) without relying on Steam's servers.
 *   **Seamless Integration**: Acts as a proxy for the legitimate Windows `version.dll`, meaning it loads automatically when Steam starts without requiring an external injector.
 
