@@ -624,17 +624,9 @@ inline bool IsSteamToolsSpoofed(uint32_t appId, const std::string& steamPath) {
                 for (const auto& entry : fs::directory_iterator(dir)) {
                     if (entry.is_regular_file()) {
                         std::string filename = entry.path().filename().string();
+                        // Only check filename to avoid false positives with common numbers like 730 (CS2)
                         if (filename.find(appIdStr) != std::string::npos) {
                             return true;
-                        }
-                        if (entry.path().extension() == ".lua" || entry.path().extension() == ".txt" || entry.path().extension() == ".json") {
-                            std::ifstream file(entry.path());
-                            std::string line;
-                            while (std::getline(file, line)) {
-                                if (line.find(appIdStr) != std::string::npos) {
-                                    return true;
-                                }
-                            }
                         }
                     }
                 }
@@ -1789,6 +1781,30 @@ typedef HANDLE(WINAPI* FindFirstFileExW_t)(LPCWSTR lpFileName, FINDEX_INFO_LEVEL
 static FindFirstFileW_t OriginalFindFirstFileW = nullptr;
 static FindFirstFileExW_t OriginalFindFirstFileExW = nullptr;
 
+typedef BOOL(WINAPI* MoveFileW_t)(LPCWSTR, LPCWSTR);
+static MoveFileW_t OriginalMoveFileW = nullptr;
+
+typedef BOOL(WINAPI* MoveFileExW_t)(LPCWSTR, LPCWSTR, DWORD);
+static MoveFileExW_t OriginalMoveFileExW = nullptr;
+
+BOOL WINAPI HookedMoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName) {
+    if (lpExistingFileName && lpNewFileName) {
+        if (wcsstr(lpExistingFileName, L"\\ac\\Win") || wcsstr(lpNewFileName, L"\\ac\\Win")) {
+            return TRUE; // Fake success to prevent AutoCloud quarantine
+        }
+    }
+    return OriginalMoveFileW(lpExistingFileName, lpNewFileName);
+}
+
+BOOL WINAPI HookedMoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
+    if (lpExistingFileName && lpNewFileName) {
+        if (wcsstr(lpExistingFileName, L"\\ac\\Win") || wcsstr(lpNewFileName, L"\\ac\\Win")) {
+            return TRUE; // Fake success to prevent AutoCloud quarantine
+        }
+    }
+    return OriginalMoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+}
+
 typedef BOOL(WINAPI* WriteFile_t)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
 static WriteFile_t OriginalWriteFile = nullptr;
 
@@ -1944,6 +1960,8 @@ void ApplyAllHooks() {
     HookAllModulesIAT("kernel32.dll", "CreateFileW", (PROC)HookedCreateFileW, (PROC*)&OriginalCreateFileW);
     HookAllModulesIAT("kernel32.dll", "CreateFileA", (PROC)HookedCreateFileA, (PROC*)&OriginalCreateFileA);
     HookAllModulesIAT("kernel32.dll", "CloseHandle", (PROC)HookedCloseHandle, (PROC*)&OriginalCloseHandle);
+    HookAllModulesIAT("kernel32.dll", "MoveFileW", (PROC)HookedMoveFileW, (PROC*)&OriginalMoveFileW);
+    HookAllModulesIAT("kernel32.dll", "MoveFileExW", (PROC)HookedMoveFileExW, (PROC*)&OriginalMoveFileExW);
     HookAllModulesIAT("kernel32.dll", "WriteFile", (PROC)HookedWriteFile, (PROC*)&OriginalWriteFile);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryW", (PROC)HookedLoadLibraryW, (PROC*)&OriginalLoadLibraryW);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryExW", (PROC)HookedLoadLibraryExW, (PROC*)&OriginalLoadLibraryExW);
