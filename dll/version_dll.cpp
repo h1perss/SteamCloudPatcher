@@ -613,10 +613,42 @@ inline bool IsManifestSpoofed(uint32_t appId, const std::string& steamPath, cons
     return false;
 }
 
+inline bool IsSteamToolsSpoofed(uint32_t appId, const std::string& steamPath) {
+    std::string appIdStr = std::to_string(appId);
+    fs::path configDir = fs::path(steamPath) / "config";
+    std::vector<fs::path> dirsToCheck = { configDir / "stplugin", configDir / "lua", configDir / "stplugin" / "lua" };
+    
+    for (const auto& dir : dirsToCheck) {
+        if (fs::exists(dir) && fs::is_directory(dir)) {
+            try {
+                for (const auto& entry : fs::directory_iterator(dir)) {
+                    if (entry.is_regular_file()) {
+                        std::string filename = entry.path().filename().string();
+                        if (filename.find(appIdStr) != std::string::npos) {
+                            return true;
+                        }
+                        if (entry.path().extension() == ".lua" || entry.path().extension() == ".txt" || entry.path().extension() == ".json") {
+                            std::ifstream file(entry.path());
+                            std::string line;
+                            while (std::getline(file, line)) {
+                                if (line.find(appIdStr) != std::string::npos) {
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (...) {}
+        }
+    }
+    return false;
+}
+
 inline bool IsGameSpoofed(uint32_t appId) {
     if (g_steamPath.empty()) return false;
     if (IsInGreenLumaAppList(appId, g_steamPath)) return true;
     if (IsManifestSpoofed(appId, g_steamPath, g_steamUserId)) return true;
+    if (IsSteamToolsSpoofed(appId, g_steamPath)) return true;
     return false;
 }
 
