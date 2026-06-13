@@ -51,6 +51,7 @@ static std::string g_backupPath = "";
 static std::string g_patcherPath;
 static HANDLE g_patcherProcess = nullptr;
 static uint32_t g_lastLaunchSyncedAppId = 0;
+static std::mutex g_configMutex;
 static std::set<uint32_t> g_patchedAppIds;
 
 inline std::optional<std::string> ReadRegistryString(HKEY hKeyRoot, const std::string& subKey, const std::string& valueName) {
@@ -512,6 +513,7 @@ inline void CreateBackup(const std::string& sourcePath, const std::string& gameN
 }
 
 inline void LoadConfig(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(g_configMutex);
     fs::path configPath = fs::path(dir) / "config.json";
     if (fs::exists(configPath)) {
         try {
@@ -536,6 +538,7 @@ inline void LoadConfig(const std::string& dir) {
 }
 
 inline void SaveConfig(const std::string& dir) {
+    std::lock_guard<std::mutex> lock(g_configMutex);
     fs::path configPath = fs::path(dir) / "config.json";
     try {
         json j = {
@@ -1768,6 +1771,30 @@ BOOL WINAPI HookedWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytes
             const char* appIdStr = strstr(buf, "[AppID ");
             if (appIdStr) {
                 t_currentAppId = (uint32_t)atoi(appIdStr + 7);
+                
+                // Auto-Detect "Access Denied" errors and automatically add to patched list!
+                if (t_currentAppId != 0 && strstr(buf, "Upload Access Denied")) {
+                    bool needsAdd = false;
+                    {
+                        std::lock_guard<std::mutex> lock(g_configMutex);
+                        if (g_patchedAppIds.find(t_currentAppId) == g_patchedAppIds.end()) {
+                            g_patchedAppIds.insert(t_currentAppId);
+                            needsAdd = true;
+                        }
+                    }
+                    if (needsAdd) {
+                        SaveConfig(g_steamPath);
+                        LogDebug("AUTO-DETECTED CLOUD ERROR! Automatically patched AppID " + std::to_string(t_currentAppId));
+                        
+                        // Delete the remotecache.vdf asynchronously so it fixes on the very next launch
+                        std::thread([](uint32_t appId, std::string steamPath, std::string steamUserId) {
+                            std::this_thread::sleep_for(std::chrono::seconds(5)); // Wait for Steam to finish current sync
+                            fs::path cacheFile = fs::path(steamPath) / "userdata" / steamUserId / std::to_string(appId) / "remotecache.vdf";
+                            std::error_code ec;
+                            fs::remove(cacheFile, ec);
+                        }, t_currentAppId, g_steamPath, g_steamUserId).detach();
+                    }
+                }
             }
         }
     }
