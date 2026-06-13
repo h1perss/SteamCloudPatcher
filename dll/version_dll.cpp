@@ -621,10 +621,9 @@ inline bool IsGameSpoofed(uint32_t appId) {
 }
 
 bool IsGameTracked(uint32_t appId) {
+    std::lock_guard<std::mutex> lock(g_configMutex);
     if (g_patchedAppIds.find(appId) != g_patchedAppIds.end()) return true;
-    if (g_autoPatch && !g_autoProvider.empty() && !g_steamPath.empty()) {
-        if (IsGameSpoofed(appId)) return true;
-    }
+    if (IsGameSpoofed(appId)) return true;
     return false;
 }
 
@@ -1802,10 +1801,10 @@ BOOL WINAPI HookedWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytes
 }
 
 bool ShouldHideFromSteamCloud(LPCWSTR lpFileName) {
-    if (!lpFileName || g_patchedAppIds.empty()) return false;
+    if (!lpFileName) return false;
     
-    // IF THIS THREAD IS NOT LOGGING ABOUT A PATCHED APPID, ALLOW EVERYTHING (Fixes CS2 and legit games losing saves)
-    if (t_currentAppId == 0 || g_patchedAppIds.find(t_currentAppId) == g_patchedAppIds.end()) {
+    // IF THIS THREAD IS NOT LOGGING ABOUT A PATCHED OR SPOOFED APPID, ALLOW EVERYTHING (Fixes CS2 and legit games losing saves)
+    if (t_currentAppId == 0 || !IsGameTracked(t_currentAppId)) {
         return false;
     }
 
