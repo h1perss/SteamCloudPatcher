@@ -1968,20 +1968,74 @@ static MoveFileA_t OriginalMoveFileA = ::MoveFileA;
 typedef BOOL(WINAPI* MoveFileExA_t)(LPCSTR, LPCSTR, DWORD);
 static MoveFileExA_t OriginalMoveFileExA = ::MoveFileExA;
 
-inline bool IsSteamAutoCloudQuarantinePathW(LPCWSTR path) {
-    if (!path) return false;
+inline uint32_t ExtractAppIdFromQuarantinePathW(LPCWSTR path) {
+    if (!path) return 0;
     std::wstring lower(path);
     std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
-    return (lower.find(L"\\userdata\\") != std::wstring::npos && 
-            lower.find(L"\\ac\\win") != std::wstring::npos);
+    std::replace(lower.begin(), lower.end(), L'/', L'\\');
+    size_t userdataPos = lower.find(L"\\userdata\\");
+    if (userdataPos == std::wstring::npos) {
+        if (lower.rfind(L"userdata\\", 0) == 0) {
+            userdataPos = 0;
+        } else {
+            return 0;
+        }
+    }
+    size_t acPos = lower.find(L"\\ac\\win", userdataPos);
+    if (acPos == std::wstring::npos) return 0;
+    size_t userIdStart = (userdataPos == 0) ? 9 : (userdataPos + 10);
+    size_t nextSlash = lower.find(L"\\", userIdStart);
+    if (nextSlash == std::wstring::npos || nextSlash >= acPos) return 0;
+    size_t appIdStart = nextSlash + 1;
+    size_t appIdEnd = acPos;
+    if (appIdEnd <= appIdStart) return 0;
+    std::wstring appIdStr = lower.substr(appIdStart, appIdEnd - appIdStart);
+    try {
+        return std::stoul(appIdStr);
+    } catch (...) {
+        return 0;
+    }
+}
+
+inline uint32_t ExtractAppIdFromQuarantinePathA(LPCSTR path) {
+    if (!path) return 0;
+    std::string lower(path);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    std::replace(lower.begin(), lower.end(), '/', '\\');
+    size_t userdataPos = lower.find("\\userdata\\");
+    if (userdataPos == std::string::npos) {
+        if (lower.rfind("userdata\\", 0) == 0) {
+            userdataPos = 0;
+        } else {
+            return 0;
+        }
+    }
+    size_t acPos = lower.find("\\ac\\win", userdataPos);
+    if (acPos == std::string::npos) return 0;
+    size_t userIdStart = (userdataPos == 0) ? 9 : (userdataPos + 10);
+    size_t nextSlash = lower.find("\\", userIdStart);
+    if (nextSlash == std::string::npos || nextSlash >= acPos) return 0;
+    size_t appIdStart = nextSlash + 1;
+    size_t appIdEnd = acPos;
+    if (appIdEnd <= appIdStart) return 0;
+    std::string appIdStr = lower.substr(appIdStart, appIdEnd - appIdStart);
+    try {
+        return std::stoul(appIdStr);
+    } catch (...) {
+        return 0;
+    }
+}
+
+inline bool IsSteamAutoCloudQuarantinePathW(LPCWSTR path) {
+    uint32_t appId = ExtractAppIdFromQuarantinePathW(path);
+    if (appId == 0) return false;
+    return IsGameTracked(appId);
 }
 
 inline bool IsSteamAutoCloudQuarantinePathA(LPCSTR path) {
-    if (!path) return false;
-    std::string lower(path);
-    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)::tolower(c); });
-    return (lower.find("\\userdata\\") != std::string::npos && 
-            lower.find("\\ac\\win") != std::string::npos);
+    uint32_t appId = ExtractAppIdFromQuarantinePathA(path);
+    if (appId == 0) return false;
+    return IsGameTracked(appId);
 }
 
 inline std::string WideToAnsi(const std::wstring& wstr) {

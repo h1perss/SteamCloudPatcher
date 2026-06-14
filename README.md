@@ -30,7 +30,7 @@ The DLL queries `SOFTWARE\Valve\Steam\ActiveProcess` -> `ActiveUser` dynamically
 
 ### 4. Refined AutoCloud Quarantine Bypass
 To prevent Steam from quarantining files during sync conflicts or account-switching, the DLL hooks `MoveFileW`, `MoveFileExW`, `MoveFileA`, and `MoveFileExA`.
-Unlike generic hooks, it uses a refined `IsSteamAutoCloudQuarantinePath` check to only block move operations containing `\ac\win` inside the `userdata` directory. This bypasses Steam's quarantine mechanism while safely avoiding false positives in game directories (like `\ac\Win64` anti-cheat folders), ensuring legitimate game settings (like CS2) are never wiped or lost.
+Unlike generic hooks, the DLL dynamically parses the AppID from the quarantine path (e.g. `\userdata\<UserID>\<AppID>\ac\win`) and checks it against tracked games. Move operations are only blocked if the path belongs to a tracked (patched) game. This completely prevents any interference with Steam client settings (AppID 7) or legitimate games (like CS2), ensuring settings switch smoothly and are never lost on account changes.
 
 ### 5. Local Cache Management
 The patcher proactively clears the `remotecache.vdf` for managed games to prevent Steam from remembering past file states, ensuring a clean slate on every launch.
