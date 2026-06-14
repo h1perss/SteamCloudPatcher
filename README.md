@@ -8,6 +8,8 @@ A lightweight, robust proxy DLL (`version.dll`) designed to permanently fix Stea
 *   **AutoCloud Blinder**: Intercepts Steam's internal file system scanners to prevent unauthorized sync attempts.
 *   **Memory Patching**: Dynamically patches `steamclient64.dll` at runtime to skip Cloud Rewrite Error evaluations.
 *   **Intelligent Auto-Detect**: No manual configuration required! The patcher monitors Steam's internal logs and instantly patches any game that triggers an "Access Denied" error, applying the fix completely automatically.
+*   **Multi-Account / Profile Support**: Dynamically detects the active Steam account (`ActiveUser` registry key) to ensure correct userdata paths are used when switching accounts.
+*   **AutoCloud Quarantine Protection**: Safely prevents Steam from quarantining (moving/deleting) configuration files during sync conflicts or switching accounts.
 *   **Local Save Redirection**: Safely backs up your actual save files to a unified location (e.g., OneDrive) without relying on Steam's servers.
 *   **Seamless Integration**: Acts as a proxy for the legitimate Windows `version.dll`, meaning it loads automatically when Steam starts without requiring an external injector.
 
@@ -23,7 +25,14 @@ By blinding Steam to the existence of these local files, Steam concludes that th
 For edge cases where the Cloud state evaluation still triggers an error (such as existing cached entries in `remotecache.vdf`), the DLL scans the memory of `steamclient64.dll` for a specific execution branch.
 It finds the signature responsible for evaluating `k_ERemoteStorageSyncStateError` and applies a targeted 1-byte patch (changing a conditional short-jump `JE` to an unconditional `JMP`). This forces Steam to silently skip the error handling logic, instantly reverting the UI to the "In-Sync" (Green Tick) status.
 
-### 3. Local Cache Management
+### 3. Dynamic User ID & Account Switching
+The DLL queries `SOFTWARE\Valve\Steam\ActiveProcess` -> `ActiveUser` dynamically to identify the logged-in user ID. This ensures that when switching profiles/accounts on Steam, the patcher immediately resolves the correct paths under `userdata\<AccountID>` for configuration and cache clearing.
+
+### 4. Refined AutoCloud Quarantine Bypass
+To prevent Steam from quarantining files during sync conflicts or account-switching, the DLL hooks `MoveFileW`, `MoveFileExW`, `MoveFileA`, and `MoveFileExA`.
+Unlike generic hooks, it uses a refined `IsSteamAutoCloudQuarantinePath` check to only block move operations containing `\ac\win` inside the `userdata` directory. This bypasses Steam's quarantine mechanism while safely avoiding false positives in game directories (like `\ac\Win64` anti-cheat folders), ensuring legitimate game settings (like CS2) are never wiped or lost.
+
+### 5. Local Cache Management
 The patcher proactively clears the `remotecache.vdf` for managed games to prevent Steam from remembering past file states, ensuring a clean slate on every launch.
 
 ## 🚀 Installation

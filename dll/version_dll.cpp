@@ -42,7 +42,6 @@ using json = nlohmann::json;
 static std::atomic<bool> g_dllRunning{true};
 void LogDebug(const std::string& msg);
 static std::string g_steamPath;
-static std::string g_steamUserId;
 static bool g_autoPatch = true;
 static std::string g_autoProvider = "onedrive";
 static std::string g_autoCustomPath = "";
@@ -53,6 +52,10 @@ static HANDLE g_patcherProcess = nullptr;
 static uint32_t g_lastLaunchSyncedAppId = 0;
 static std::mutex g_configMutex;
 static std::set<uint32_t> g_patchedAppIds;
+static std::atomic<uint32_t> g_activeSyncingAppId{0};
+static std::atomic<uint64_t> g_activeSyncingAppIdSetTimeMs{0};
+static std::set<uint32_t> g_excludedAppIds = { 730, 570, 440, 1172470, 578080, 230410, 1085660, 252490 };
+
 
 inline std::optional<std::string> ReadRegistryString(HKEY hKeyRoot, const std::string& subKey, const std::string& valueName) {
     HKEY hKey = nullptr;
@@ -97,6 +100,28 @@ inline std::optional<std::string> ReadFileContents(const fs::path& filePath) {
     return ss.str();
 }
 
+inline std::string GetActiveSteamUserId() {
+    auto userIdOpt = ReadRegistryDword(HKEY_CURRENT_USER, "SOFTWARE\\Valve\\Steam\\ActiveProcess", "ActiveUser");
+    if (userIdOpt.has_value() && *userIdOpt != 0) {
+        return std::to_string(*userIdOpt);
+    }
+    if (!g_steamPath.empty()) {
+        std::error_code ec;
+        fs::path userdataPath = fs::path(g_steamPath) / "userdata";
+        if (fs::exists(userdataPath, ec) && fs::is_directory(userdataPath, ec)) {
+            for (const auto& entry : fs::directory_iterator(userdataPath, ec)) {
+                if (entry.is_directory(ec)) {
+                    std::string dn = entry.path().filename().string();
+                    if (!dn.empty() && dn != "0" && std::all_of(dn.begin(), dn.end(), [](unsigned char c) { return ::isdigit(c); })) {
+                        return dn;
+                    }
+                }
+            }
+        }
+    }
+    return "0";
+}
+
 inline std::string GetUserProfilePath() {
     char* profile = nullptr;
     size_t len = 0;
@@ -138,28 +163,31 @@ inline std::vector<std::pair<std::string, std::string>> ParseVdfKeyValues(const 
 inline std::vector<std::string> FindSteamLibraryFolders(const std::string& steamPath) {
     std::vector<std::string> folders;
     folders.push_back(steamPath);
-    fs::path vdfPath = fs::path(steamPath) / "steamapps" / "libraryfolders.vdf";
-    auto content = ReadFileContents(vdfPath);
-    if (content.has_value()) {
-        auto kvPairs = ParseVdfKeyValues(*content);
-        for (const auto& [key, value] : kvPairs) {
-            if (key == "path" && !value.empty()) {
-                std::string normalized = value;
-                std::string unescaped;
-                for (size_t i = 0; i < normalized.size(); ++i) {
-                    if (normalized[i] == '\\' && i + 1 < normalized.size() && normalized[i + 1] == '\\') {
-                        unescaped += '\\';
-                        ++i;
-                    } else {
-                        unescaped += normalized[i];
+    try {
+        fs::path vdfPath = fs::path(steamPath) / "steamapps" / "libraryfolders.vdf";
+        auto content = ReadFileContents(vdfPath);
+        if (content.has_value()) {
+            auto kvPairs = ParseVdfKeyValues(*content);
+            for (const auto& [key, value] : kvPairs) {
+                if (key == "path" && !value.empty()) {
+                    std::string normalized = value;
+                    std::string unescaped;
+                    for (size_t i = 0; i < normalized.size(); ++i) {
+                        if (normalized[i] == '\\' && i + 1 < normalized.size() && normalized[i + 1] == '\\') {
+                            unescaped += '\\';
+                            ++i;
+                        } else {
+                            unescaped += normalized[i];
+                        }
                     }
-                }
-                if (fs::exists(unescaped) && unescaped != steamPath) {
-                    folders.push_back(unescaped);
+                    std::error_code ec;
+                    if (fs::exists(unescaped, ec) && unescaped != steamPath) {
+                        folders.push_back(unescaped);
+                    }
                 }
             }
         }
-    }
+    } catch (...) {}
     return folders;
 }
 
@@ -323,65 +351,69 @@ struct GameInfo {
 
 inline std::vector<GameInfo> DetectGames(const std::string& steamPath, const std::string& userId) {
     std::vector<GameInfo> list;
-    std::set<uint32_t> appIds;
-    std::map<uint32_t, std::string> names;
-    std::set<uint32_t> installed;
+    try {
+        std::set<uint32_t> appIds;
+        std::map<uint32_t, std::string> names;
+        std::set<uint32_t> installed;
 
-    auto libs = FindSteamLibraryFolders(steamPath);
-    for (const auto& folder : libs) {
-        fs::path steamapps = fs::path(folder) / "steamapps";
-        if (fs::exists(steamapps) && fs::is_directory(steamapps)) {
-            for (const auto& entry : fs::directory_iterator(steamapps)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".acf") {
-                    std::string fn = entry.path().filename().string();
-                    if (fn.rfind("appmanifest_", 0) == 0) {
-                        auto p = ParseManifestFile(entry.path());
-                        if (p) {
-                            names[p->first] = p->second;
-                            installed.insert(p->first);
-                            appIds.insert(p->first);
+        auto libs = FindSteamLibraryFolders(steamPath);
+        for (const auto& folder : libs) {
+            fs::path steamapps = fs::path(folder) / "steamapps";
+            std::error_code ec;
+            if (fs::exists(steamapps, ec) && fs::is_directory(steamapps, ec)) {
+                for (const auto& entry : fs::directory_iterator(steamapps, ec)) {
+                    if (entry.is_regular_file(ec) && entry.path().extension() == ".acf") {
+                        std::string fn = entry.path().filename().string();
+                        if (fn.rfind("appmanifest_", 0) == 0) {
+                            auto p = ParseManifestFile(entry.path());
+                            if (p) {
+                                names[p->first] = p->second;
+                                installed.insert(p->first);
+                                appIds.insert(p->first);
+                            }
                         }
                     }
                 }
             }
         }
-    }
 
-    fs::path userdata = fs::path(steamPath) / "userdata" / userId;
-    if (fs::exists(userdata) && fs::is_directory(userdata)) {
-        for (const auto& entry : fs::directory_iterator(userdata)) {
-            if (entry.is_directory()) {
-                std::string dn = entry.path().filename().string();
-                if (!dn.empty() && std::all_of(dn.begin(), dn.end(), ::isdigit)) {
-                    try {
-                        uint32_t aid = std::stoul(dn);
-                        if (aid > 10) appIds.insert(aid);
-                    } catch (...) {}
+        fs::path userdata = fs::path(steamPath) / "userdata" / userId;
+        std::error_code ec;
+        if (fs::exists(userdata, ec) && fs::is_directory(userdata, ec)) {
+            for (const auto& entry : fs::directory_iterator(userdata, ec)) {
+                if (entry.is_directory(ec)) {
+                    std::string dn = entry.path().filename().string();
+                    if (!dn.empty() && std::all_of(dn.begin(), dn.end(), [](unsigned char c) { return ::isdigit(c); })) {
+                        try {
+                            uint32_t aid = std::stoul(dn);
+                            if (aid > 10) appIds.insert(aid);
+                        } catch (...) {}
+                    }
                 }
             }
         }
-    }
 
-    for (uint32_t aid : appIds) {
-        GameInfo gi;
-        gi.appId = aid;
-        gi.installed = (installed.find(aid) != installed.end());
-        gi.name = (names.find(aid) != names.end()) ? names[aid] : "Steam App " + std::to_string(aid);
+        for (uint32_t aid : appIds) {
+            GameInfo gi;
+            gi.appId = aid;
+            gi.installed = (installed.find(aid) != installed.end());
+            gi.name = (names.find(aid) != names.end()) ? names[aid] : "Steam App " + std::to_string(aid);
 
-        fs::path rcPath = fs::path(steamPath) / "userdata" / userId / std::to_string(aid) / "remotecache.vdf";
-        std::optional<std::string> resolved;
-        if (fs::exists(rcPath)) {
-            resolved = ResolvePathFromRemoteCache(rcPath, steamPath, userId);
+            fs::path rcPath = fs::path(steamPath) / "userdata" / userId / std::to_string(aid) / "remotecache.vdf";
+            std::optional<std::string> resolved;
+            if (fs::exists(rcPath, ec)) {
+                resolved = ResolvePathFromRemoteCache(rcPath, steamPath, userId);
+            }
+
+            if (resolved && !resolved->empty()) {
+                gi.resolvedSavePath = *resolved;
+            } else {
+                fs::path usp = fs::path(steamPath) / "userdata" / userId / std::to_string(aid) / "remote";
+                gi.resolvedSavePath = usp.string();
+            }
+            list.push_back(std::move(gi));
         }
-
-        if (resolved && !resolved->empty()) {
-            gi.resolvedSavePath = *resolved;
-        } else {
-            fs::path usp = fs::path(steamPath) / "userdata" / userId / std::to_string(aid) / "remote";
-            gi.resolvedSavePath = usp.string();
-        }
-        list.push_back(std::move(gi));
-    }
+    } catch (...) {}
     return list;
 }
 
@@ -532,6 +564,11 @@ inline void LoadConfig(const std::string& dir) {
                         if (item.is_number()) g_patchedAppIds.insert(item.get<uint32_t>());
                     }
                 }
+                if (j.contains("excludedGames") && j["excludedGames"].is_array()) {
+                    for (const auto& item : j["excludedGames"]) {
+                        if (item.is_number()) g_excludedAppIds.insert(item.get<uint32_t>());
+                    }
+                }
             }
         } catch (...) {}
     }
@@ -557,104 +594,107 @@ inline void SaveConfig(const std::string& dir) {
 }
 
 inline bool IsInGreenLumaAppList(uint32_t appId, const std::string& steamPath) {
-    fs::path appListDir = fs::path(steamPath) / "AppList";
-    if (fs::exists(appListDir) && fs::is_directory(appListDir)) {
-        for (const auto& entry : fs::directory_iterator(appListDir)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".txt") {
-                try {
-                    std::ifstream txt(entry.path());
-                    std::string line;
-                    if (std::getline(txt, line)) {
-                        line.erase(0, line.find_first_not_of(" \t\r\n"));
-                        line.erase(line.find_last_not_of(" \t\r\n") + 1);
-                        if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
-                            uint32_t aid = std::stoul(line);
-                            if (aid == appId) return true;
+    try {
+        fs::path appListDir = fs::path(steamPath) / "AppList";
+        std::error_code ec;
+        if (fs::exists(appListDir, ec) && fs::is_directory(appListDir, ec)) {
+            for (const auto& entry : fs::directory_iterator(appListDir, ec)) {
+                if (entry.is_regular_file(ec) && entry.path().extension() == ".txt") {
+                    try {
+                        std::ifstream txt(entry.path());
+                        std::string line;
+                        if (std::getline(txt, line)) {
+                            line.erase(0, line.find_first_not_of(" \t\r\n"));
+                            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+                            if (!line.empty() && std::all_of(line.begin(), line.end(), [](unsigned char c) { return ::isdigit(c); })) {
+                                uint32_t aid = std::stoul(line);
+                                if (aid == appId) return true;
+                            }
                         }
-                    }
-                } catch (...) {}
+                    } catch (...) {}
+                }
             }
         }
-    }
+    } catch (...) {}
     return false;
 }
 
 inline bool IsManifestSpoofed(uint32_t appId, const std::string& steamPath, const std::string& userId) {
-    if (userId.empty() || userId == "0") return false;
-    uint64_t accountId = 0;
     try {
-        accountId = std::stoull(userId);
-    } catch (...) {
-        return false;
-    }
-    uint64_t userSteamID64 = 0x0110000100000000ULL | accountId;
-    
-    auto libs = FindSteamLibraryFolders(steamPath);
-    for (const auto& folder : libs) {
-        fs::path manifestPath = fs::path(folder) / "steamapps" / ("appmanifest_" + std::to_string(appId) + ".acf");
-        if (fs::exists(manifestPath)) {
-            auto contentOpt = ReadFileContents(manifestPath);
-            if (contentOpt) {
-                std::regex ownerRegex(R"raw("LastOwner"\s+"(\d+)")raw", std::regex_constants::icase);
-                std::smatch match;
-                if (std::regex_search(*contentOpt, match, ownerRegex)) {
-                    try {
-                        uint64_t lastOwner = std::stoull(match[1].str());
-                        if (lastOwner != 0 && lastOwner != userSteamID64) {
-                            return true;
-                        }
-                    } catch (...) {}
-                } else {
-                    return true;
+        if (userId.empty() || userId == "0") return false;
+        uint64_t accountId = 0;
+        try {
+            accountId = std::stoull(userId);
+        } catch (...) {
+            return false;
+        }
+        uint64_t userSteamID64 = 0x0110000100000000ULL | accountId;
+        
+        auto libs = FindSteamLibraryFolders(steamPath);
+        for (const auto& folder : libs) {
+            fs::path manifestPath = fs::path(folder) / "steamapps" / ("appmanifest_" + std::to_string(appId) + ".acf");
+            std::error_code ec;
+            if (fs::exists(manifestPath, ec)) {
+                auto contentOpt = ReadFileContents(manifestPath);
+                if (contentOpt) {
+                    std::regex ownerRegex(R"raw("LastOwner"\s+"(\d+)")raw", std::regex_constants::icase);
+                    std::smatch match;
+                    if (std::regex_search(*contentOpt, match, ownerRegex)) {
+                        try {
+                            uint64_t lastOwner = std::stoull(match[1].str());
+                            if (lastOwner != 0 && lastOwner != userSteamID64) {
+                                return true;
+                            }
+                        } catch (...) {}
+                    } else {
+                        return true;
+                    }
                 }
             }
         }
-    }
+    } catch (...) {}
     return false;
 }
 
 inline bool IsSteamToolsSpoofed(uint32_t appId, const std::string& steamPath) {
-    std::string appIdStr = std::to_string(appId);
-    fs::path configDir = fs::path(steamPath) / "config";
-    std::vector<fs::path> dirsToCheck = { configDir / "stplug-in", configDir / "lua", configDir / "stplug-in" / "lua" };
-    
-    for (const auto& dir : dirsToCheck) {
-        if (fs::exists(dir) && fs::is_directory(dir)) {
-            try {
-                for (const auto& entry : fs::directory_iterator(dir)) {
-                    if (entry.is_regular_file()) {
-                        std::string filename = entry.path().filename().string();
-                        // Only check filename to avoid false positives with common numbers like 730 (CS2)
-                        if (filename.find(appIdStr) != std::string::npos) {
-                            return true;
-                        }
+    try {
+        std::string appIdStr = std::to_string(appId);
+        fs::path configDir = fs::path(steamPath) / "config";
+        std::vector<fs::path> dirsToCheck = { configDir / "stplug-in", configDir / "lua", configDir / "stplug-in" / "lua" };
+        
+        for (const auto& dir : dirsToCheck) {
+            std::error_code ec;
+            if (fs::exists(dir, ec) && fs::is_directory(dir, ec)) {
+                for (const auto& entry : fs::directory_iterator(dir, ec)) {
+                    std::string filename = entry.path().filename().string();
+                    std::string stem = entry.path().stem().string();
+                    if (stem == appIdStr || filename == appIdStr) {
+                        return true;
                     }
                 }
-            } catch (...) {}
+            }
         }
-    }
+    } catch (...) {}
     return false;
 }
 
 inline bool IsGameSpoofed(uint32_t appId) {
-    if (g_steamPath.empty()) return false;
-    if (IsInGreenLumaAppList(appId, g_steamPath)) return true;
-    if (IsManifestSpoofed(appId, g_steamPath, g_steamUserId)) return true;
-    if (IsSteamToolsSpoofed(appId, g_steamPath)) return true;
+    try {
+        if (g_steamPath.empty()) return false;
+        if (g_excludedAppIds.find(appId) != g_excludedAppIds.end()) return false;
+        if (IsSteamToolsSpoofed(appId, g_steamPath)) return true;
+    } catch (...) {}
     return false;
 }
 
 bool IsGameTracked(uint32_t appId) {
-    std::lock_guard<std::mutex> lock(g_configMutex);
-    if (g_patchedAppIds.find(appId) != g_patchedAppIds.end()) return true;
-    if (IsGameSpoofed(appId)) return true;
-    return false;
+    return IsGameSpoofed(appId);
 }
 
 void TriggerLaunchPatch(uint32_t appId) {
     g_lastLaunchSyncedAppId = appId;
     if (g_steamPath.empty() || g_autoProvider.empty()) return;
-    auto list = DetectGames(g_steamPath, g_steamUserId);
+    auto list = DetectGames(g_steamPath, GetActiveSteamUserId());
     for (const auto& g : list) {
         if (g.appId == appId && !g.resolvedSavePath.empty()) {
             std::string target = GetProviderSavePath(g_autoProvider, g_autoCustomPath, g.name, g.appId);
@@ -683,7 +723,7 @@ void TriggerExitPatch(uint32_t appId) {
         g_lastLaunchSyncedAppId = 0;
     }
     if (g_steamPath.empty() || g_autoProvider.empty()) return;
-    auto list = DetectGames(g_steamPath, g_steamUserId);
+    auto list = DetectGames(g_steamPath, GetActiveSteamUserId());
     for (const auto& g : list) {
         if (g.appId == appId && !g.resolvedSavePath.empty()) {
             std::string target = GetProviderSavePath(g_autoProvider, g_autoCustomPath, g.name, g.appId);
@@ -698,7 +738,7 @@ void TriggerExitPatch(uint32_t appId) {
                 SyncDirectories(g.resolvedSavePath, universalTarget);
             }
             std::string sPath = g_steamPath;
-            std::string uId = g_steamUserId;
+            std::string uId = GetActiveSteamUserId();
             std::string rPath = g.resolvedSavePath;
             std::thread([sPath, uId, appId, rPath]() {
                 for (int i = 0; i < 5; ++i) {
@@ -783,6 +823,97 @@ typedef BOOL(WINAPI* CreateProcessW_t)(
 
 static CreateProcessW_t OriginalCreateProcessW = CreateProcessW;
 
+__declspec(noinline) bool TryScanAndPatchMemory(uint8_t* base, DWORD size, uint8_t** pPatchAddr, uint8_t* origBytes) {
+    __try {
+        for (DWORD i = 0; i < size - 50; i++) {
+            if (base[i] == 0x85 && base[i+1] == 0xC0 &&
+                base[i+2] == 0x0F && base[i+3] == 0x85) 
+            {
+                if (base[i+8] == 0x40 && base[i+9] == 0x84 && base[i+10] == 0xFF &&
+                    base[i+11] == 0x74 && base[i+12] == 0x19) 
+                {
+                    if (base[i+38] == 0x8B && base[i+39] == 0x45 && base[i+40] == 0x64) {
+                        DWORD oldProtect;
+                        if (VirtualProtect(base + i + 38, 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+                            *pPatchAddr = base + i + 38;
+                            origBytes[0] = base[i+38];
+                            origBytes[1] = base[i+39];
+                            origBytes[2] = base[i+40];
+                            base[i+38] = 0x6A; 
+                            base[i+39] = 0x01; 
+                            base[i+40] = 0x58; 
+                            VirtualProtect(base + i + 38, 3, oldProtect, &oldProtect);
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
+__declspec(noinline) bool TryRestoreMemory(uint8_t* patchAddr, uint8_t* origBytes) {
+    __try {
+        DWORD oldProtect;
+        if (VirtualProtect(patchAddr, 3, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            memcpy(patchAddr, origBytes, 3);
+            VirtualProtect(patchAddr, 3, oldProtect, &oldProtect);
+            return true;
+        }
+    } __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+    return false;
+}
+
+void ApplyMemoryPatch15s() {
+    static std::mutex s_patchMutex;
+    static int s_activePatches = 0;
+    static uint8_t* s_patchAddr1 = nullptr;
+    static uint8_t s_origBytes2[3] = {0, 0, 0};
+    
+    {
+        std::lock_guard<std::mutex> lock(s_patchMutex);
+        s_activePatches++;
+        if (s_activePatches == 1) {
+            LogDebug("Applying temporary Cloud Fix Memory Patch for 15s...");
+            HMODULE hSteamClient = GetModuleHandleA("steamclient64.dll");
+            if (hSteamClient) {
+                MODULEINFO modInfo;
+                if (GetModuleInformation(GetCurrentProcess(), hSteamClient, &modInfo, sizeof(modInfo))) {
+                    uint8_t* base = (uint8_t*)modInfo.lpBaseOfDll;
+                    DWORD size = modInfo.SizeOfImage;
+                    if (TryScanAndPatchMemory(base, size, &s_patchAddr1, s_origBytes2)) {
+                        LogDebug("Temporary SINGLE patch applied (EAX=1)!");
+                    } else {
+                        LogDebug("Temporary SINGLE patch failed or pattern not found.");
+                    }
+                }
+            }
+        }
+    }
+    
+    std::this_thread::sleep_for(std::chrono::seconds(15));
+    
+    {
+        std::lock_guard<std::mutex> lock(s_patchMutex);
+        s_activePatches--;
+        if (s_activePatches == 0) {
+            if (s_patchAddr1) {
+                if (TryRestoreMemory(s_patchAddr1, s_origBytes2)) {
+                    LogDebug("Temporary SINGLE patch removed.");
+                } else {
+                    LogDebug("Temporary SINGLE patch removal failed!");
+                }
+            }
+            s_patchAddr1 = nullptr;
+        }
+    }
+}
+
 BOOL WINAPI HookedCreateProcessW(
     LPCWSTR lpApplicationName,
     LPWSTR lpCommandLine,
@@ -802,18 +933,91 @@ BOOL WINAPI HookedCreateProcessW(
         }
     }
 
-    return OriginalCreateProcessW(
-        lpApplicationName,
-        lpCommandLine,
-        lpProcessAttributes,
-        lpThreadAttributes,
-        bInheritHandles,
-        dwCreationFlags,
-        lpEnvironment,
-        lpCurrentDirectory,
-        lpStartupInfo,
-        lpProcessInformation
-    );
+    
+    
+    bool isGame = true;
+    if (lpApplicationName) {
+        std::wstring appName(lpApplicationName);
+        if (appName.find(L"steamwebhelper.exe") != std::wstring::npos ||
+            appName.find(L"crashhandler") != std::wstring::npos ||
+            appName.find(L"gldriverquery") != std::wstring::npos ||
+            appName.find(L"vulkaninfo") != std::wstring::npos ||
+            appName.find(L"steam.exe") != std::wstring::npos) {
+            isGame = false;
+        }
+    }
+    if (lpCommandLine) {
+        std::wstring cmdLine(lpCommandLine);
+        if (cmdLine.find(L"steamwebhelper.exe") != std::wstring::npos ||
+            cmdLine.find(L"crashhandler") != std::wstring::npos ||
+            cmdLine.find(L"gldriverquery") != std::wstring::npos ||
+            cmdLine.find(L"vulkaninfo") != std::wstring::npos ||
+            cmdLine.find(L"steam.exe") != std::wstring::npos) {
+            isGame = false;
+        }
+    }
+
+    std::string dllPath = std::string(g_steamPath) + "\\version.dll";
+    std::string hiddenPath = std::string(g_steamPath) + "\\version_hidden.dll";
+    
+    if (isGame) {
+        rename(dllPath.c_str(), hiddenPath.c_str());
+    }
+
+    BOOL ret = FALSE;
+    if (OriginalCreateProcessW) {
+        ret = OriginalCreateProcessW(
+            lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
+            bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory,
+            lpStartupInfo, lpProcessInformation
+        );
+    } else {
+        ret = ::CreateProcessW(
+            lpApplicationName, lpCommandLine, lpProcessAttributes, lpThreadAttributes,
+            bInheritHandles, dwCreationFlags, lpEnvironment, lpCurrentDirectory,
+            lpStartupInfo, lpProcessInformation
+        );
+    }
+
+    if (ret && isGame) {
+        HANDLE hProcess = lpProcessInformation->hProcess;
+        
+        std::thread([hProcess]() {
+            try {
+                
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                
+                auto appVal = ReadRegistryDword(HKEY_CURRENT_USER, "SOFTWARE\\Valve\\Steam", "RunningAppID");
+                uint32_t currentAppId = (appVal.has_value()) ? *appVal : 0; 
+                
+                WaitForSingleObject(hProcess, INFINITE);
+                
+                if (currentAppId > 0 && IsGameTracked(currentAppId)) {
+                    LogDebug("Game exited! Pre-emptively setting g_activeSyncingAppId to " + std::to_string(currentAppId));
+                    g_activeSyncingAppId = currentAppId;
+                    g_activeSyncingAppIdSetTimeMs = GetTickCount64();
+                    LogDebug("Calling ApplyMemoryPatch15s() from thread...");
+                    ApplyMemoryPatch15s();
+                    if (g_activeSyncingAppId == currentAppId) {
+                        g_activeSyncingAppId = 0;
+                        LogDebug("Cleared pre-emptive g_activeSyncingAppId after 15s wait.");
+                    }
+                }
+                
+                std::string dllPath = std::string(g_steamPath) + "\\version.dll";
+                std::string hiddenPath = std::string(g_steamPath) + "\\version_hidden.dll";
+                std::error_code ec;
+                if (fs::exists(hiddenPath, ec) && !fs::exists(dllPath, ec)) {
+                    rename(hiddenPath.c_str(), dllPath.c_str());
+                    LogDebug("Renamed version_hidden.dll back to version.dll");
+                }
+            } catch (...) {
+                LogDebug("HookedCreateProcessW thread: exception caught!");
+            }
+        }).detach();
+    }
+
+    return ret;
 }
 
 inline size_t FindSectionCaseInsensitive(const std::string& content, const std::string& sectionName, size_t startPos = 0) {
@@ -899,17 +1103,17 @@ inline bool PatchVdfContent(std::string& content, const std::set<uint32_t>& trac
             if (appBracePos != std::string::npos) {
                 size_t appEndBracePos = FindMatchingBrace(content, appBracePos);
                 if (appEndBracePos != std::string::npos) {
-                    SetKeyValueInRange(content, appBracePos + 1, appEndBracePos, "cloudenabled", "1", 6);
+                    SetKeyValueInRange(content, appBracePos + 1, appEndBracePos, "cloudenabled", "0", 6);
                     appEndBracePos = FindMatchingBrace(content, appBracePos);
                     if (appEndBracePos != std::string::npos) {
-                        SetKeyValueInRange(content, appBracePos + 1, appEndBracePos, "CloudEnabled", "1", 6);
+                        SetKeyValueInRange(content, appBracePos + 1, appEndBracePos, "CloudEnabled", "0", 6);
                     }
                     changed = true;
                 }
             }
         } else {
             std::string indent = "\t\t\t\t\t";
-            std::string newSection = "\n" + indent + "\"" + appIdStr + "\"\n" + indent + "{\n" + indent + "\t\"cloudenabled\"\t\t\"1\"\n" + indent + "\t\"CloudEnabled\"\t\t\"1\"\n" + indent + "}";
+            std::string newSection = "\n" + indent + "\"" + appIdStr + "\"\n" + indent + "{\n" + indent + "\t\"cloudenabled\"\t\t\"0\"\n" + indent + "\t\"CloudEnabled\"\t\t\"0\"\n" + indent + "}";
             content.insert(appsBracePos + 1, newSection);
             changed = true;
         }
@@ -918,83 +1122,8 @@ inline bool PatchVdfContent(std::string& content, const std::set<uint32_t>& trac
 }
 
 inline void PatchConfigIfNeeded(const fs::path& configPath) {
-    try {
-        if (!fs::exists(configPath)) return;
-        auto contentOpt = ReadFileContents(configPath);
-        if (!contentOpt) return;
-        
-        std::string content = *contentOpt;
-        std::set<uint32_t> appIdsToDisable;
-        
-        for (uint32_t aid : g_patchedAppIds) {
-            appIdsToDisable.insert(aid);
-        }
-        
-        if (g_autoPatch && !g_steamPath.empty()) {
-            auto list = DetectGames(g_steamPath, g_steamUserId);
-            for (const auto& g : list) {
-                if (g.installed && IsGameSpoofed(g.appId)) {
-                    appIdsToDisable.insert(g.appId);
-                }
-            }
-        }
-        
-        fs::path appListDir = fs::path(g_steamPath) / "AppList";
-        if (fs::exists(appListDir) && fs::is_directory(appListDir)) {
-            for (const auto& entry : fs::directory_iterator(appListDir)) {
-                if (entry.is_regular_file() && entry.path().extension() == ".txt") {
-                    try {
-                        std::ifstream txt(entry.path());
-                        std::string line;
-                        if (std::getline(txt, line)) {
-                            line.erase(0, line.find_first_not_of(" \t\r\n"));
-                            line.erase(line.find_last_not_of(" \t\r\n") + 1);
-                            if (!line.empty() && std::all_of(line.begin(), line.end(), ::isdigit)) {
-                                uint32_t aid = std::stoul(line);
-                                if (aid > 0) appIdsToDisable.insert(aid);
-                            }
-                        }
-                    } catch (...) {}
-                }
-            }
-        }
-        
-        if (PatchVdfContent(content, appIdsToDisable)) {
-            SetFileAttributesW(configPath.wstring().c_str(), FILE_ATTRIBUTE_NORMAL);
-            std::ofstream out(configPath, std::ios::binary);
-            if (out.is_open()) {
-                out << content;
-            }
-        }
-    } catch (...) {}
-}
-
-void DisableSteamCloudUIAndErrors() {
-    if (g_steamPath.empty()) return;
-    std::string uId = g_steamUserId;
-    if (uId.empty() || uId == "0") {
-        fs::path userdataPath = fs::path(g_steamPath) / "userdata";
-        if (fs::exists(userdataPath) && fs::is_directory(userdataPath)) {
-            for (const auto& entry : fs::directory_iterator(userdataPath)) {
-                if (entry.is_directory()) {
-                    std::string dn = entry.path().filename().string();
-                    if (!dn.empty() && dn != "0" && std::all_of(dn.begin(), dn.end(), ::isdigit)) {
-                        uId = dn;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if (uId.empty() || uId == "0") return;
     
-    fs::path sharedConfigPath = fs::path(g_steamPath) / "userdata" / uId / "7" / "remote" / "sharedconfig.vdf";
-    fs::path localConfigPath = fs::path(g_steamPath) / "userdata" / uId / "config" / "localconfig.vdf";
-    
-    PatchConfigIfNeeded(sharedConfigPath);
-    PatchConfigIfNeeded(localConfigPath);
 }
-
 typedef HANDLE(WINAPI* CreateFileW_t)(LPCWSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 typedef HANDLE(WINAPI* CreateFileA_t)(LPCSTR, DWORD, DWORD, LPSECURITY_ATTRIBUTES, DWORD, DWORD, HANDLE);
 typedef BOOL(WINAPI* CloseHandle_t)(HANDLE);
@@ -1003,49 +1132,52 @@ typedef HMODULE(WINAPI* LoadLibraryExW_t)(LPCWSTR, HANDLE, DWORD);
 typedef HMODULE(WINAPI* LoadLibraryA_t)(LPCSTR);
 typedef HMODULE(WINAPI* LoadLibraryExA_t)(LPCSTR, HANDLE, DWORD);
 
-static CreateFileW_t OriginalCreateFileW = CreateFileW;
-static CreateFileA_t OriginalCreateFileA = CreateFileA;
-static CloseHandle_t OriginalCloseHandle = CloseHandle;
+static thread_local bool t_inFileSystemHook = false;
+
+__declspec(noinline) inline bool SafeCopyStringW(wchar_t* dest, const wchar_t* src, size_t maxLen) {
+    __try {
+        if (!dest || !src || maxLen == 0) return false;
+        size_t i = 0;
+        for (; i < maxLen - 1; ++i) {
+            wchar_t c = src[i];
+            dest[i] = c;
+            if (c == L'\0') {
+                break;
+            }
+        }
+        dest[i] = L'\0';
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+__declspec(noinline) inline bool SafeCopyStringA(char* dest, const char* src, size_t maxLen) {
+    __try {
+        if (!dest || !src || maxLen == 0) return false;
+        size_t i = 0;
+        for (; i < maxLen - 1; ++i) {
+            char c = src[i];
+            dest[i] = c;
+            if (c == '\0') {
+                break;
+            }
+        }
+        dest[i] = '\0';
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+static CreateFileW_t OriginalCreateFileW = nullptr;
+static CreateFileA_t OriginalCreateFileA = nullptr;
 static LoadLibraryW_t OriginalLoadLibraryW = LoadLibraryW;
 static LoadLibraryExW_t OriginalLoadLibraryExW = LoadLibraryExW;
 static LoadLibraryA_t OriginalLoadLibraryA = LoadLibraryA;
 static LoadLibraryExA_t OriginalLoadLibraryExA = LoadLibraryExA;
-
-static std::mutex g_handleMutex;
-static std::set<HANDLE> g_trackedConfigHandles;
-static std::map<HANDLE, std::wstring> g_handlePathMap;
-
-inline bool IsSteamConfigPathW(const std::wstring& path, bool& isSharedConfig, bool& isLocalConfig) {
-    isSharedConfig = false;
-    isLocalConfig = false;
-    std::wstring lowerPath = path;
-    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](wchar_t c) { return (wchar_t)std::tolower(static_cast<int>(c)); });
-    if (lowerPath.find(L"sharedconfig.vdf") != std::wstring::npos) {
-        isSharedConfig = true;
-        return true;
-    }
-    if (lowerPath.find(L"localconfig.vdf") != std::wstring::npos) {
-        isLocalConfig = true;
-        return true;
-    }
-    return false;
-}
-
-inline bool IsSteamConfigPathA(const std::string& path, bool& isSharedConfig, bool& isLocalConfig) {
-    isSharedConfig = false;
-    isLocalConfig = false;
-    std::string lowerPath = path;
-    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](unsigned char c) { return (char)std::tolower(c); });
-    if (lowerPath.find("sharedconfig.vdf") != std::string::npos) {
-        isSharedConfig = true;
-        return true;
-    }
-    if (lowerPath.find("localconfig.vdf") != std::string::npos) {
-        isLocalConfig = true;
-        return true;
-    }
-    return false;
-}
 
 HANDLE WINAPI HookedCreateFileW(
     LPCWSTR lpFileName,
@@ -1056,34 +1188,58 @@ HANDLE WINAPI HookedCreateFileW(
     DWORD dwFlagsAndAttributes,
     HANDLE hTemplateFile
 ) {
-    if (lpFileName) {
-        std::wstring path(lpFileName);
-        bool isShared = false;
-        bool isLocal = false;
-        if (IsSteamConfigPathW(path, isShared, isLocal)) {
-            if ((dwDesiredAccess & GENERIC_WRITE) == 0) {
-                PatchConfigIfNeeded(path);
+    if (t_inFileSystemHook) {
+        if (OriginalCreateFileW) {
+            return OriginalCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+        }
+        return INVALID_HANDLE_VALUE;
+    }
+
+    t_inFileSystemHook = true;
+    HANDLE hResult = INVALID_HANDLE_VALUE;
+    bool redirect = false;
+
+    wchar_t localPath[MAX_PATH];
+    if (lpFileName && SafeCopyStringW(localPath, lpFileName, MAX_PATH)) {
+        std::wstring path(localPath);
+        std::wstring lowerPath = path;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+        
+        if (lowerPath.find(L"remotecache.vdf") != std::wstring::npos) {
+            size_t remotePos = lowerPath.find(L"\\remotecache.vdf");
+            if (remotePos != std::wstring::npos) {
+                size_t slashPos = lowerPath.rfind(L"\\", remotePos - 1);
+                if (slashPos != std::wstring::npos) {
+                    std::wstring appIdStr = lowerPath.substr(slashPos + 1, remotePos - slashPos - 1);
+                    try {
+                        uint32_t appId = std::stoul(appIdStr);
+                        if (IsGameTracked(appId)) {
+                            LogDebug("REDIRECTED kernelbase CreateFileW remotecache.vdf to NUL for AppID " + std::to_string(appId));
+                            redirect = true;
+                        }
+                    } catch (...) {}
+                }
             }
-            
-            HANDLE hFile = OriginalCreateFileW(
-                lpFileName,
-                dwDesiredAccess,
-                dwShareMode,
-                lpSecurityAttributes,
-                dwCreationDisposition,
-                dwFlagsAndAttributes,
-                hTemplateFile
-            );
-            
-            if (hFile != INVALID_HANDLE_VALUE && (dwDesiredAccess & GENERIC_WRITE)) {
-                std::lock_guard<std::mutex> lock(g_handleMutex);
-                g_trackedConfigHandles.insert(hFile);
-                g_handlePathMap[hFile] = path;
-            }
-            return hFile;
         }
     }
-    return OriginalCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+
+    if (redirect) {
+        if (OriginalCreateFileW) {
+            hResult = OriginalCreateFileW(L"\\\\.\\NUL", dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+        } else {
+            hResult = INVALID_HANDLE_VALUE;
+        }
+        t_inFileSystemHook = false;
+        return hResult;
+    }
+
+    if (OriginalCreateFileW) {
+        hResult = OriginalCreateFileW(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    } else {
+        hResult = INVALID_HANDLE_VALUE;
+    }
+    t_inFileSystemHook = false;
+    return hResult;
 }
 
 HANDLE WINAPI HookedCreateFileA(
@@ -1095,56 +1251,58 @@ HANDLE WINAPI HookedCreateFileA(
     DWORD dwFlagsAndAttributes,
     HANDLE hTemplateFile
 ) {
-    if (lpFileName) {
-        std::string path(lpFileName);
-        bool isShared = false;
-        bool isLocal = false;
-        if (IsSteamConfigPathA(path, isShared, isLocal)) {
-            if ((dwDesiredAccess & GENERIC_WRITE) == 0) {
-                PatchConfigIfNeeded(path);
-            }
-            
-            HANDLE hFile = OriginalCreateFileA(
-                lpFileName,
-                dwDesiredAccess,
-                dwShareMode,
-                lpSecurityAttributes,
-                dwCreationDisposition,
-                dwFlagsAndAttributes,
-                hTemplateFile
-            );
-            
-            if (hFile != INVALID_HANDLE_VALUE && (dwDesiredAccess & GENERIC_WRITE)) {
-                std::lock_guard<std::mutex> lock(g_handleMutex);
-                g_trackedConfigHandles.insert(hFile);
-                std::wstring wpath(path.begin(), path.end());
-                g_handlePathMap[hFile] = wpath;
-            }
-            return hFile;
+    if (t_inFileSystemHook) {
+        if (OriginalCreateFileA) {
+            return OriginalCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
         }
+        return INVALID_HANDLE_VALUE;
     }
-    return OriginalCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
-}
 
-BOOL WINAPI HookedCloseHandle(HANDLE hObject) {
-    bool isConfigHandle = false;
-    std::wstring configPath;
-    {
-        std::lock_guard<std::mutex> lock(g_handleMutex);
-        auto it = g_trackedConfigHandles.find(hObject);
-        if (it != g_trackedConfigHandles.end()) {
-            isConfigHandle = true;
-            g_trackedConfigHandles.erase(it);
-            configPath = g_handlePathMap[hObject];
-            g_handlePathMap.erase(hObject);
+    t_inFileSystemHook = true;
+    HANDLE hResult = INVALID_HANDLE_VALUE;
+    bool redirect = false;
+
+    char localPath[MAX_PATH];
+    if (lpFileName && SafeCopyStringA(localPath, lpFileName, MAX_PATH)) {
+        std::string path(localPath);
+        std::string lowerPath = path;
+        std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), [](unsigned char c) { return (char)::tolower(c); });
+        
+        if (lowerPath.find("remotecache.vdf") != std::string::npos) {
+            size_t remotePos = lowerPath.find("\\remotecache.vdf");
+            if (remotePos != std::string::npos) {
+                size_t slashPos = lowerPath.rfind("\\", remotePos - 1);
+                if (slashPos != std::string::npos) {
+                    std::string appIdStr = lowerPath.substr(slashPos + 1, remotePos - slashPos - 1);
+                    try {
+                        uint32_t appId = std::stoul(appIdStr);
+                        if (IsGameTracked(appId)) {
+                            LogDebug("REDIRECTED kernelbase CreateFileA remotecache.vdf to NUL for AppID " + std::to_string(appId));
+                            redirect = true;
+                        }
+                    } catch (...) {}
+                }
+            }
         }
     }
 
-    BOOL result = OriginalCloseHandle(hObject);
-    if (isConfigHandle && !configPath.empty()) {
-        PatchConfigIfNeeded(configPath);
+    if (redirect) {
+        if (OriginalCreateFileA) {
+            hResult = OriginalCreateFileA("\\\\.\\NUL", dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+        } else {
+            hResult = INVALID_HANDLE_VALUE;
+        }
+        t_inFileSystemHook = false;
+        return hResult;
     }
-    return result;
+
+    if (OriginalCreateFileA) {
+        hResult = OriginalCreateFileA(lpFileName, dwDesiredAccess, dwShareMode, lpSecurityAttributes, dwCreationDisposition, dwFlagsAndAttributes, hTemplateFile);
+    } else {
+        hResult = INVALID_HANDLE_VALUE;
+    }
+    t_inFileSystemHook = false;
+    return hResult;
 }
 
 void HookAllModulesIAT(const char* targetDllName, const char* functionName, PROC hookFunction, PROC* originalFunction) {
@@ -1261,21 +1419,7 @@ enum ERemoteStorageSyncState
 static constexpr int VTIDX_GetIClientRemoteStorage      = 23;
 inline void LogDebug(const std::string& msg) {
     try {
-        static fs::path logPath;
-        static bool pathResolved = false;
-        if (!pathResolved) {
-            char* localAppData = nullptr;
-            size_t len = 0;
-            if (_dupenv_s(&localAppData, &len, "LOCALAPPDATA") == 0 && localAppData != nullptr) {
-                logPath = fs::path(localAppData) / "SteamCloudPatcher" / "patcher_dll.log";
-                free(localAppData);
-            } else {
-                logPath = "C:\\SteamCloudPatcher\\patcher_dll.log";
-            }
-            fs::create_directories(logPath.parent_path());
-            pathResolved = true;
-        }
-        std::ofstream logFile(logPath, std::ios::app);
+        std::ofstream logFile("C:\\Program Files (x86)\\Steam\\patcher_debug.log", std::ios_base::app);
         if (logFile.is_open()) {
             auto now = std::chrono::system_clock::now();
             auto time = std::chrono::system_clock::to_time_t(now);
@@ -1473,6 +1617,19 @@ bool HookedResolveSyncConflict(void* self, uint32 nAppId, bool bAcceptLocalFiles
     return true;
 }
 static void* g_lastClientRemoteStorage = nullptr;
+typedef void (*SetCloudEnabledForApp_t)(void* self, uint32_t nAppId, bool bEnable);
+static SetCloudEnabledForApp_t OriginalSetCloudEnabledForApp = nullptr;
+
+void HookedSetCloudEnabledForApp(void* self, uint32_t nAppId, bool bEnable) {
+    if (bEnable && IsGameTracked(nAppId)) {
+        LogDebug("BLOCKED Steam Engine from re-enabling Cloud for tracked AppID: " + std::to_string(nAppId));
+        return; 
+    }
+    if (OriginalSetCloudEnabledForApp) {
+        OriginalSetCloudEnabledForApp(self, nAppId, bEnable);
+    }
+}
+
 static bool HookIClientRemoteStorageSEH(void* remoteStorage, DWORD* pExceptionCode) {
     *pExceptionCode = 0;
     __try {
@@ -1501,6 +1658,10 @@ void HookIClientRemoteStorage(void* remoteStorage) {
     LogDebug("HookIClientRemoteStorage: Hooking IClientRemoteStorage at " + ([](void* p) {
         char buf[32]; sprintf_s(buf, "0x%p", p); return std::string(buf);
     })(remoteStorage));
+    
+    
+    OriginalSetCloudEnabledForApp = (SetCloudEnabledForApp_t)HookVTableMethod(remoteStorage, 20, (PROC)HookedSetCloudEnabledForApp);
+    
     OriginalIsCloudEnabledForApp = (IsCloudEnabledForApp_t)HookVTableMethod(remoteStorage, VTIDX_IsCloudEnabledForApp, (PROC)HookedIsCloudEnabledForApp);
     g_originalEvaluateRemoteStorageSyncState = HookVTableMethod(remoteStorage, VTIDX_EvaluateRemoteStorageSyncState, (PROC)HookedEvaluateRemoteStorageSyncState);
     OriginalGetRemoteStorageSyncState = (GetRemoteStorageSyncState_t)HookVTableMethod(remoteStorage, VTIDX_GetRemoteStorageSyncState, (PROC)HookedGetRemoteStorageSyncState);
@@ -1685,7 +1846,7 @@ void ApplyCloudFixMemoryPatch() {
 }
 
 void TryDirectRemoteStorageHook() {
-    ApplyCloudFixMemoryPatch();
+    
     if (g_remoteStorageHooked.load()) return;
     if (!OriginalCreateInterface) {
         HMODULE hSteamclient = GetSteamClientModule();
@@ -1781,153 +1942,566 @@ typedef HANDLE(WINAPI* FindFirstFileExW_t)(LPCWSTR lpFileName, FINDEX_INFO_LEVEL
 static FindFirstFileW_t OriginalFindFirstFileW = nullptr;
 static FindFirstFileExW_t OriginalFindFirstFileExW = nullptr;
 
+typedef HANDLE(WINAPI* FindFirstFileA_t)(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData);
+typedef HANDLE(WINAPI* FindFirstFileExA_t)(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData, FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags);
+typedef DWORD(WINAPI* GetFileAttributesW_t)(LPCWSTR lpFileName);
+typedef BOOL(WINAPI* GetFileAttributesExW_t)(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation);
+typedef DWORD(WINAPI* GetFileAttributesA_t)(LPCSTR lpFileName);
+typedef BOOL(WINAPI* GetFileAttributesExA_t)(LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation);
+
+static FindFirstFileA_t OriginalFindFirstFileA = nullptr;
+static FindFirstFileExA_t OriginalFindFirstFileExA = nullptr;
+static GetFileAttributesW_t OriginalGetFileAttributesW = nullptr;
+static GetFileAttributesExW_t OriginalGetFileAttributesExW = nullptr;
+static GetFileAttributesA_t OriginalGetFileAttributesA = nullptr;
+static GetFileAttributesExA_t OriginalGetFileAttributesExA = nullptr;
+
 typedef BOOL(WINAPI* MoveFileW_t)(LPCWSTR, LPCWSTR);
-static MoveFileW_t OriginalMoveFileW = nullptr;
+static MoveFileW_t OriginalMoveFileW = ::MoveFileW;
 
 typedef BOOL(WINAPI* MoveFileExW_t)(LPCWSTR, LPCWSTR, DWORD);
-static MoveFileExW_t OriginalMoveFileExW = nullptr;
+static MoveFileExW_t OriginalMoveFileExW = ::MoveFileExW;
+
+typedef BOOL(WINAPI* MoveFileA_t)(LPCSTR, LPCSTR);
+static MoveFileA_t OriginalMoveFileA = ::MoveFileA;
+
+typedef BOOL(WINAPI* MoveFileExA_t)(LPCSTR, LPCSTR, DWORD);
+static MoveFileExA_t OriginalMoveFileExA = ::MoveFileExA;
+
+inline bool IsSteamAutoCloudQuarantinePathW(LPCWSTR path) {
+    if (!path) return false;
+    std::wstring lower(path);
+    std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+    return (lower.find(L"\\userdata\\") != std::wstring::npos && 
+            lower.find(L"\\ac\\win") != std::wstring::npos);
+}
+
+inline bool IsSteamAutoCloudQuarantinePathA(LPCSTR path) {
+    if (!path) return false;
+    std::string lower(path);
+    std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) { return (char)::tolower(c); });
+    return (lower.find("\\userdata\\") != std::string::npos && 
+            lower.find("\\ac\\win") != std::string::npos);
+}
 
 BOOL WINAPI HookedMoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName) {
-    if (lpExistingFileName && lpNewFileName) {
-        if (wcsstr(lpExistingFileName, L"\\ac\\Win") || wcsstr(lpNewFileName, L"\\ac\\Win")) {
-            return TRUE; // Fake success to prevent AutoCloud quarantine
-        }
+    if (IsSteamAutoCloudQuarantinePathW(lpExistingFileName) || IsSteamAutoCloudQuarantinePathW(lpNewFileName)) {
+        LogDebug("BLOCKED MoveFileW for AutoCloud quarantine path");
+        return TRUE;
     }
-    return OriginalMoveFileW(lpExistingFileName, lpNewFileName);
+    if (OriginalMoveFileW) {
+        return OriginalMoveFileW(lpExistingFileName, lpNewFileName);
+    }
+    return ::MoveFileW(lpExistingFileName, lpNewFileName);
 }
 
 BOOL WINAPI HookedMoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
-    if (lpExistingFileName && lpNewFileName) {
-        if (wcsstr(lpExistingFileName, L"\\ac\\Win") || wcsstr(lpNewFileName, L"\\ac\\Win")) {
-            return TRUE; // Fake success to prevent AutoCloud quarantine
-        }
+    if (IsSteamAutoCloudQuarantinePathW(lpExistingFileName) || IsSteamAutoCloudQuarantinePathW(lpNewFileName)) {
+        LogDebug("BLOCKED MoveFileExW for AutoCloud quarantine path");
+        return TRUE;
     }
-    return OriginalMoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+    if (OriginalMoveFileExW) {
+        return OriginalMoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+    }
+    return ::MoveFileExW(lpExistingFileName, lpNewFileName, dwFlags);
+}
+
+BOOL WINAPI HookedMoveFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName) {
+    if (IsSteamAutoCloudQuarantinePathA(lpExistingFileName) || IsSteamAutoCloudQuarantinePathA(lpNewFileName)) {
+        LogDebug("BLOCKED MoveFileA for AutoCloud quarantine path");
+        return TRUE;
+    }
+    if (OriginalMoveFileA) {
+        return OriginalMoveFileA(lpExistingFileName, lpNewFileName);
+    }
+    return ::MoveFileA(lpExistingFileName, lpNewFileName);
+}
+
+BOOL WINAPI HookedMoveFileExA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName, DWORD dwFlags) {
+    if (IsSteamAutoCloudQuarantinePathA(lpExistingFileName) || IsSteamAutoCloudQuarantinePathA(lpNewFileName)) {
+        LogDebug("BLOCKED MoveFileExA for AutoCloud quarantine path");
+        return TRUE;
+    }
+    if (OriginalMoveFileExA) {
+        return OriginalMoveFileExA(lpExistingFileName, lpNewFileName, dwFlags);
+    }
+    return ::MoveFileExA(lpExistingFileName, lpNewFileName, dwFlags);
 }
 
 typedef BOOL(WINAPI* WriteFile_t)(HANDLE, LPCVOID, DWORD, LPDWORD, LPOVERLAPPED);
-static WriteFile_t OriginalWriteFile = nullptr;
+static WriteFile_t OriginalWriteFile = ::WriteFile;
 
 thread_local uint32_t t_currentAppId = 0;
 
 BOOL WINAPI HookedWriteFile(HANDLE hFile, LPCVOID lpBuffer, DWORD nNumberOfBytesToWrite, LPDWORD lpNumberOfBytesWritten, LPOVERLAPPED lpOverlapped) {
-    if (lpBuffer && nNumberOfBytesToWrite > 15) {
+    if (lpBuffer && nNumberOfBytesToWrite > 0) {
         const char* buf = (const char*)lpBuffer;
-        // Optimization: Steam logs usually start with '[' (e.g. "[2026-06-12...")
         if (buf[0] == '[') {
-            const char* appIdStr = strstr(buf, "[AppID ");
-            if (appIdStr) {
-                t_currentAppId = (uint32_t)atoi(appIdStr + 7);
-                
-                // Auto-Detect "Access Denied" errors and automatically add to patched list!
-                if (t_currentAppId != 0 && strstr(buf, "Upload Access Denied")) {
-                    bool needsAdd = false;
-                    {
-                        std::lock_guard<std::mutex> lock(g_configMutex);
-                        if (g_patchedAppIds.find(t_currentAppId) == g_patchedAppIds.end()) {
-                            g_patchedAppIds.insert(t_currentAppId);
-                            needsAdd = true;
+            std::string_view data(buf, nNumberOfBytesToWrite);
+            size_t pos = data.find("[AppID ");
+            if (pos != std::string_view::npos) {
+                size_t start = pos + 7;
+                size_t end = data.find(']', start);
+                if (end != std::string_view::npos) {
+                    std::string_view idStr = data.substr(start, end - start);
+                    uint32_t parsedId = 0;
+                    for (char c : idStr) {
+                        if (c >= '0' && c <= '9') {
+                            parsedId = parsedId * 10 + (c - '0');
+                        } else {
+                            break;
                         }
                     }
-                    if (needsAdd) {
-                        SaveConfig(g_steamPath);
-                        LogDebug("AUTO-DETECTED CLOUD ERROR! Automatically patched AppID " + std::to_string(t_currentAppId));
+                    if (parsedId > 0) {
+                        t_currentAppId = parsedId;
+
+                        if (IsGameTracked(parsedId)) {
+                            if (data.find("Starting sync") != std::string_view::npos) {
+                                g_activeSyncingAppId = parsedId;
+                                g_activeSyncingAppIdSetTimeMs = GetTickCount64();
+                            }
+                            else if (data.find("complete") != std::string_view::npos || 
+                                     data.find("Eval complete") != std::string_view::npos ||
+                                     data.find("YldWriteCache") != std::string_view::npos) {
+                                if (g_activeSyncingAppId == parsedId) {
+                                    g_activeSyncingAppId = 0;
+                                }
+                            }
+                        }
                         
-                        // Delete the remotecache.vdf asynchronously so it fixes on the very next launch
-                        std::thread([](uint32_t appId, std::string steamPath, std::string steamUserId) {
-                            std::this_thread::sleep_for(std::chrono::seconds(5)); // Wait for Steam to finish current sync
-                            fs::path cacheFile = fs::path(steamPath) / "userdata" / steamUserId / std::to_string(appId) / "remotecache.vdf";
-                            std::error_code ec;
-                            fs::remove(cacheFile, ec);
-                        }, t_currentAppId, g_steamPath, g_steamUserId).detach();
+                        
+                        if (data.find("Upload Access Denied") != std::string_view::npos) {
+                            bool needsAdd = false;
+                            {
+                                std::lock_guard<std::mutex> lock(g_configMutex);
+                                if (g_patchedAppIds.find(t_currentAppId) == g_patchedAppIds.end()) {
+                                    g_patchedAppIds.insert(t_currentAppId);
+                                    needsAdd = true;
+                                }
+                            }
+                            if (needsAdd) {
+                                SaveConfig(g_steamPath);
+                                LogDebug("AUTO-DETECTED CLOUD ERROR! Automatically patched AppID " + std::to_string(t_currentAppId));
+                                
+                                std::thread([](uint32_t appId, std::string path, std::string user) {
+                                    std::this_thread::sleep_for(std::chrono::seconds(2));
+                                    fs::path cacheFile = fs::path(path) / "userdata" / user / std::to_string(appId) / "remotecache.vdf";
+                                    std::error_code ec;
+                                    fs::remove(cacheFile, ec);
+                                }, t_currentAppId, std::string(g_steamPath), GetActiveSteamUserId()).detach();
+                            }
+                        }
+                        
+                        
+                        if (IsGameTracked(parsedId)) {
+                            if (data.find("Upload Access Denied") != std::string_view::npos ||
+                                data.find("Upload complete, result Access Denied") != std::string_view::npos ||
+                                data.find("result Access Denied") != std::string_view::npos) {
+                                LogDebug("BLOCKED cloud_log.txt error write for tracked AppID " + std::to_string(parsedId));
+                                
+                                if (lpNumberOfBytesWritten) *lpNumberOfBytesWritten = nNumberOfBytesToWrite;
+                                return TRUE;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    return OriginalWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+    if (OriginalWriteFile) {
+        return OriginalWriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+    }
+    return ::WriteFile(hFile, lpBuffer, nNumberOfBytesToWrite, lpNumberOfBytesWritten, lpOverlapped);
+}inline bool IsGenericKeyword(const std::wstring& keyword) {
+    static const std::set<std::wstring> genericKeywords = {
+        L"steam", L"common", L"game", L"saves", L"save", L"data", L"valve",
+        L"play", L"player", L"user", L"local", L"remote", L"cloud", L"edition",
+        L"version", L"collection", L"public", L"shared", L"config", L"cfg",
+        L"setting", L"settings", L"the", L"and", L"of", L"for", L"with",
+        L"online", L"offline", L"multiplayer", L"singleplayer"
+    };
+    return genericKeywords.find(keyword) != genericKeywords.end();
+}
+
+inline std::wstring SanitizeGameName(const std::wstring& name) {
+    std::wstring sanitized;
+    for (wchar_t c : name) {
+        if ((c >= L'a' && c <= L'z') || (c >= L'0' && c <= L'9')) {
+            sanitized += c;
+        } else if (c >= L'A' && c <= L'Z') {
+            sanitized += (c - L'A' + L'a');
+        }
+    }
+    return sanitized;
+}
+
+inline std::vector<std::wstring> GetKeywordsForAppId(uint32_t appId) {
+    std::vector<std::wstring> keywords;
+    keywords.push_back(std::to_wstring(appId));
+
+    if (!g_steamPath.empty()) {
+        auto libs = FindSteamLibraryFolders(g_steamPath);
+        for (const auto& folder : libs) {
+            fs::path acfPath = fs::path(folder) / "steamapps" / ("appmanifest_" + std::to_string(appId) + ".acf");
+            std::error_code ec;
+            if (fs::exists(acfPath, ec)) {
+                auto contentOpt = ReadFileContents(acfPath);
+                if (contentOpt) {
+                    std::string content = *contentOpt;
+                    
+                    std::regex dirRegex(R"raw("installdir"\s+"([^"]+)")raw", std::regex_constants::icase);
+                    std::smatch dirMatch;
+                    if (std::regex_search(content, dirMatch, dirRegex)) {
+                        std::string dirStr = dirMatch[1].str();
+                        std::wstring wDir(dirStr.begin(), dirStr.end());
+                        std::transform(wDir.begin(), wDir.end(), wDir.begin(), ::towlower);
+                        if (!wDir.empty() && wDir.length() > 3 && !IsGenericKeyword(wDir)) {
+                            keywords.push_back(wDir);
+                        }
+                    }
+                    // Parse "name"
+                    std::regex nameRegex(R"raw("name"\s+"([^"]+)")raw", std::regex_constants::icase);
+                    std::smatch nameMatch;
+                    if (std::regex_search(content, nameMatch, nameRegex)) {
+                        std::string nameStr = nameMatch[1].str();
+                        std::wstring wName(nameStr.begin(), nameStr.end());
+                        std::transform(wName.begin(), wName.end(), wName.begin(), ::towlower);
+                        if (!wName.empty() && wName.length() > 3 && !IsGenericKeyword(wName)) {
+                            keywords.push_back(wName);
+                        }
+                        std::wstring wNameSanitized = SanitizeGameName(wName);
+                        if (!wNameSanitized.empty() && wNameSanitized.length() > 3 && !IsGenericKeyword(wNameSanitized)) {
+                            keywords.push_back(wNameSanitized);
+                        }
+                    }
+                }
+                break;
+            }
+        }
+    }
+    
+    
+    if (appId == 264710) {
+        keywords.push_back(L"subnautica");
+        keywords.push_back(L"snappdata");
+    } else if (appId == 1515210) {
+        keywords.push_back(L"rustylake");
+        keywords.push_back(L"the past within");
+        keywords.push_back(L"pastwithin");
+    }
+    
+    return keywords;
 }
 
 bool ShouldHideFromSteamCloud(LPCWSTR lpFileName) {
     if (!lpFileName) return false;
     
-    // IF THIS THREAD IS NOT LOGGING ABOUT A PATCHED OR SPOOFED APPID, ALLOW EVERYTHING (Fixes CS2 and legit games losing saves)
-    if (t_currentAppId == 0 || !IsGameTracked(t_currentAppId)) {
-        return false;
-    }
-
     wchar_t absPath[MAX_PATH];
-    if (GetFullPathNameW(lpFileName, MAX_PATH, absPath, nullptr) == 0) {
-        wcscpy_s(absPath, MAX_PATH, lpFileName);
+    if (!SafeCopyStringW(absPath, lpFileName, MAX_PATH)) {
+        return false;
     }
 
-    std::wstring path = absPath;
-    std::transform(path.begin(), path.end(), path.begin(), ::towlower);
+    std::wstring path(absPath);
+    std::wstring lowerPath = path;
+    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
     
-    // EXCEPTION: Always allow Steam's own core directories so Steam doesn't break
-    // We allow \steam\ and \steamapps\ explicitly, but we will override this exception for save folders below.
-    bool isSteamDir = (path.find(L"\\steam\\") != std::wstring::npos) || 
-                      (path.find(L"\\steamapps\\") != std::wstring::npos);
-                      
-    // EXCEPTION: Always allow Steam userdata (where Steam caches cloud states)
-    if (path.find(L"\\steam\\userdata") != std::wstring::npos || path.find(L"\\program files (x86)\\steam\\userdata") != std::wstring::npos) {
-        return false;
+    
+    if (lowerPath.find(L"remotecache.vdf") != std::wstring::npos) {
+        size_t remotePos = lowerPath.find(L"\\remotecache.vdf");
+        if (remotePos != std::wstring::npos) {
+            size_t slashPos = lowerPath.rfind(L"\\", remotePos - 1);
+            if (slashPos != std::wstring::npos) {
+                std::wstring appIdStr = lowerPath.substr(slashPos + 1, remotePos - slashPos - 1);
+                try {
+                    uint32_t appId = std::stoul(appIdStr);
+                    if (IsGameTracked(appId)) {
+                        LogDebug("ShouldHideFromSteamCloud: Hiding remotecache.vdf for AppID " + std::to_string(appId));
+                        return true;
+                    }
+                } catch (...) {}
+            }
+        }
     }
+
     
-    // UNIVERSAL SAVE LOCATION BLINDER
-    // We blind all standard Windows user directories where games are forced to save
-    bool isUserLoc = (path.find(L"\\appdata\\") != std::wstring::npos) ||
-                     (path.find(L"\\documents\\") != std::wstring::npos) ||
-                     (path.find(L"\\saved games\\") != std::wstring::npos) ||
-                     (path.find(L"\\my games\\") != std::wstring::npos) ||
-                     (path.find(L"\\programdata\\") != std::wstring::npos) ||
-                     (path.find(L"\\users\\public\\") != std::wstring::npos);
-                     
-    // We aggressively blind ANY path that specifically targets a "save" folder, even if it's inside steamapps!
-    // This catches games that save inside their own installation folders.
-    bool isSaveKeyword = (path.find(L"\\saves\\") != std::wstring::npos) ||
-                         (path.find(L"\\save\\") != std::wstring::npos) ||
-                         (path.find(L"\\savegames\\") != std::wstring::npos) ||
-                         (path.find(L"\\save_games\\") != std::wstring::npos) ||
-                         (path.find(L"\\saved\\") != std::wstring::npos);
-                         
-    if (isUserLoc || isSaveKeyword) {
-        // If it's a known user loc or save keyword, we blind it to protect against AutoCloud!
-        LogDebug("Blinded Universal AutoCloud scan: " + std::string(path.begin(), path.end()));
-        return true;
+    uint32_t activeAppId = g_activeSyncingAppId.load();
+    if (activeAppId != 0) {
+        uint64_t now = GetTickCount64();
+        if (now - g_activeSyncingAppIdSetTimeMs.load() > 30000) { 
+            LogDebug("ShouldHideFromSteamCloud: Active sync AppID " + std::to_string(activeAppId) + " timed out after 30s. Resetting to 0.");
+            g_activeSyncingAppId = 0;
+            activeAppId = 0;
+        }
     }
-    
-    // If it's inside Steam and didn't trigger the save keywords above, it's safe (e.g. game verification, updates)
-    if (isSteamDir) {
-        return false;
-    }
-    
-    // Also universally block if Steam is explicitly scanning for common save extensions anywhere
-    if (path.length() >= 4) {
-        std::wstring ext = path.substr(path.length() - 4);
-        if (ext == L".sav" || ext == L".bak" || ext == L".dat") {
-            LogDebug("Blinded AutoCloud extension scan: " + std::string(path.begin(), path.end()));
+    if (activeAppId != 0 && IsGameTracked(activeAppId)) {
+        static uint32_t s_cachedActiveAppId = 0;
+        static std::vector<std::wstring> s_cachedKeywords;
+        static std::mutex s_cacheMutex;
+
+        std::vector<std::wstring> keywords;
+        {
+            std::lock_guard<std::mutex> lock(s_cacheMutex);
+            if (s_cachedActiveAppId != activeAppId) {
+                s_cachedKeywords = GetKeywordsForAppId(activeAppId);
+                s_cachedActiveAppId = activeAppId;
+                LogDebug("Cached " + std::to_string(s_cachedKeywords.size()) + " keywords for AppID " + std::to_string(activeAppId));
+            }
+            keywords = s_cachedKeywords;
+        }
+
+        
+        bool matchesKeyword = false;
+        for (const auto& keyword : keywords) {
+            if (keyword.empty()) continue;
+            if (lowerPath.find(keyword) != std::wstring::npos) {
+                matchesKeyword = true;
+                break;
+            }
+        }
+
+        if (!matchesKeyword) {
+            return false;
+        }
+
+        std::wstring lowerSteamPath = std::wstring(g_steamPath.begin(), g_steamPath.end());
+        std::transform(lowerSteamPath.begin(), lowerSteamPath.end(), lowerSteamPath.begin(), ::towlower);
+        
+        std::string pathA;
+        for (wchar_t wc : path) pathA += (wc < 128) ? (char)wc : '?';
+        LogDebug("ShouldHideFromSteamCloud: Query " + pathA + " for AppID " + std::to_string(activeAppId));
+
+        bool shouldHide = false;
+        size_t steamPos = lowerPath.find(lowerSteamPath);
+        size_t steamAppsPos = lowerPath.find(L"\\steamapps");
+
+        if (steamAppsPos != std::wstring::npos) {
+            
+            size_t commonPos = lowerPath.find(L"\\steamapps\\common\\");
+            if (commonPos != std::wstring::npos) {
+                size_t gameFolderStart = commonPos + 18;
+                size_t nextSlash = lowerPath.find(L"\\", gameFolderStart);
+                if (nextSlash != std::wstring::npos && nextSlash + 1 < lowerPath.length()) {
+                    if (lowerPath.find(L".exe") == std::wstring::npos &&
+                        lowerPath.find(L".dll") == std::wstring::npos &&
+                        lowerPath.find(L".acf") == std::wstring::npos) 
+                    {
+                        shouldHide = true;
+                    }
+                }
+            }
+        }
+        else if (steamPos == std::wstring::npos) {
+            
+            
+            std::wstring cleanPath = lowerPath;
+            if (cleanPath.rfind(L"\\\\?\\", 0) == 0) {
+                cleanPath = cleanPath.substr(4);
+            }
+            int slashCount = 0;
+            for (wchar_t wc : cleanPath) {
+                if (wc == L'\\') slashCount++;
+            }
+            if (slashCount >= 2) {
+                if (lowerPath.find(L".exe") == std::wstring::npos &&
+                    lowerPath.find(L".dll") == std::wstring::npos &&
+                    lowerPath.find(L".acf") == std::wstring::npos) 
+                {
+                    shouldHide = true;
+                }
+            }
+        }
+
+        if (shouldHide) {
+            LogDebug("ShouldHideFromSteamCloud: HIDING save path " + pathA + " for AppID " + std::to_string(activeAppId));
             return true;
         }
     }
-    
+
     return false;
 }
 
 HANDLE WINAPI HookedFindFirstFileW(LPCWSTR lpFileName, LPWIN32_FIND_DATAW lpFindFileData) {
-    if (ShouldHideFromSteamCloud(lpFileName)) {
+    if (t_inFileSystemHook) {
+        if (OriginalFindFirstFileW) return OriginalFindFirstFileW(lpFileName, lpFindFileData);
+        return INVALID_HANDLE_VALUE;
+    }
+    t_inFileSystemHook = true;
+    bool hide = ShouldHideFromSteamCloud(lpFileName);
+    t_inFileSystemHook = false;
+
+    if (hide) {
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    return OriginalFindFirstFileW(lpFileName, lpFindFileData);
+    if (OriginalFindFirstFileW) {
+        return OriginalFindFirstFileW(lpFileName, lpFindFileData);
+    }
+    return INVALID_HANDLE_VALUE;
 }
 
 HANDLE WINAPI HookedFindFirstFileExW(LPCWSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData, FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags) {
-    if (ShouldHideFromSteamCloud(lpFileName)) {
+    if (t_inFileSystemHook) {
+        if (OriginalFindFirstFileExW) return OriginalFindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+        return INVALID_HANDLE_VALUE;
+    }
+    t_inFileSystemHook = true;
+    bool hide = ShouldHideFromSteamCloud(lpFileName);
+    t_inFileSystemHook = false;
+
+    if (hide) {
         SetLastError(ERROR_FILE_NOT_FOUND);
         return INVALID_HANDLE_VALUE;
     }
-    return OriginalFindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+    if (OriginalFindFirstFileExW) {
+        return OriginalFindFirstFileExW(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+HANDLE WINAPI HookedFindFirstFileA(LPCSTR lpFileName, LPWIN32_FIND_DATAA lpFindFileData) {
+    if (t_inFileSystemHook) {
+        if (OriginalFindFirstFileA) return OriginalFindFirstFileA(lpFileName, lpFindFileData);
+        return INVALID_HANDLE_VALUE;
+    }
+    t_inFileSystemHook = true;
+    bool hide = false;
+    char localPath[MAX_PATH];
+    if (lpFileName && SafeCopyStringA(localPath, lpFileName, MAX_PATH)) {
+        wchar_t wFileName[MAX_PATH] = {0};
+        int len = MultiByteToWideChar(CP_ACP, 0, localPath, -1, wFileName, MAX_PATH);
+        if (len > 0) {
+            hide = ShouldHideFromSteamCloud(wFileName);
+        }
+    }
+    t_inFileSystemHook = false;
+
+    if (hide) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (OriginalFindFirstFileA) {
+        return OriginalFindFirstFileA(lpFileName, lpFindFileData);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+HANDLE WINAPI HookedFindFirstFileExA(LPCSTR lpFileName, FINDEX_INFO_LEVELS fInfoLevelId, LPVOID lpFindFileData, FINDEX_SEARCH_OPS fSearchOp, LPVOID lpSearchFilter, DWORD dwAdditionalFlags) {
+    if (t_inFileSystemHook) {
+        if (OriginalFindFirstFileExA) return OriginalFindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+        return INVALID_HANDLE_VALUE;
+    }
+    t_inFileSystemHook = true;
+    bool hide = false;
+    char localPath[MAX_PATH];
+    if (lpFileName && SafeCopyStringA(localPath, lpFileName, MAX_PATH)) {
+        wchar_t wFileName[MAX_PATH] = {0};
+        int len = MultiByteToWideChar(CP_ACP, 0, localPath, -1, wFileName, MAX_PATH);
+        if (len > 0) {
+            hide = ShouldHideFromSteamCloud(wFileName);
+        }
+    }
+    t_inFileSystemHook = false;
+
+    if (hide) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_HANDLE_VALUE;
+    }
+    if (OriginalFindFirstFileExA) {
+        return OriginalFindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags);
+    }
+    return INVALID_HANDLE_VALUE;
+}
+
+DWORD WINAPI HookedGetFileAttributesW(LPCWSTR lpFileName) {
+    if (t_inFileSystemHook) {
+        if (OriginalGetFileAttributesW) return OriginalGetFileAttributesW(lpFileName);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    t_inFileSystemHook = true;
+    bool hide = ShouldHideFromSteamCloud(lpFileName);
+    t_inFileSystemHook = false;
+
+    if (hide) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    if (OriginalGetFileAttributesW) {
+        return OriginalGetFileAttributesW(lpFileName);
+    }
+    return INVALID_FILE_ATTRIBUTES;
+}
+
+BOOL WINAPI HookedGetFileAttributesExW(LPCWSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation) {
+    if (t_inFileSystemHook) {
+        if (OriginalGetFileAttributesExW) return OriginalGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+        return FALSE;
+    }
+    t_inFileSystemHook = true;
+    bool hide = ShouldHideFromSteamCloud(lpFileName);
+    t_inFileSystemHook = false;
+
+    if (hide) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+    if (OriginalGetFileAttributesExW) {
+        return OriginalGetFileAttributesExW(lpFileName, fInfoLevelId, lpFileInformation);
+    }
+    return FALSE;
+}
+
+DWORD WINAPI HookedGetFileAttributesA(LPCSTR lpFileName) {
+    if (t_inFileSystemHook) {
+        if (OriginalGetFileAttributesA) return OriginalGetFileAttributesA(lpFileName);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    t_inFileSystemHook = true;
+    bool hide = false;
+    char localPath[MAX_PATH];
+    if (lpFileName && SafeCopyStringA(localPath, lpFileName, MAX_PATH)) {
+        wchar_t wFileName[MAX_PATH] = {0};
+        int len = MultiByteToWideChar(CP_ACP, 0, localPath, -1, wFileName, MAX_PATH);
+        if (len > 0) {
+            hide = ShouldHideFromSteamCloud(wFileName);
+        }
+    }
+    t_inFileSystemHook = false;
+
+    if (hide) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    if (OriginalGetFileAttributesA) {
+        return OriginalGetFileAttributesA(lpFileName);
+    }
+    return INVALID_FILE_ATTRIBUTES;
+}
+
+BOOL WINAPI HookedGetFileAttributesExA(LPCSTR lpFileName, GET_FILEEX_INFO_LEVELS fInfoLevelId, LPVOID lpFileInformation) {
+    if (t_inFileSystemHook) {
+        if (OriginalGetFileAttributesExA) return OriginalGetFileAttributesExA(lpFileName, fInfoLevelId, lpFileInformation);
+        return FALSE;
+    }
+    t_inFileSystemHook = true;
+    bool hide = false;
+    char localPath[MAX_PATH];
+    if (lpFileName && SafeCopyStringA(localPath, lpFileName, MAX_PATH)) {
+        wchar_t wFileName[MAX_PATH] = {0};
+        int len = MultiByteToWideChar(CP_ACP, 0, localPath, -1, wFileName, MAX_PATH);
+        if (len > 0) {
+            hide = ShouldHideFromSteamCloud(wFileName);
+        }
+    }
+    t_inFileSystemHook = false;
+
+    if (hide) {
+        SetLastError(ERROR_FILE_NOT_FOUND);
+        return FALSE;
+    }
+    if (OriginalGetFileAttributesExA) {
+        return OriginalGetFileAttributesExA(lpFileName, fInfoLevelId, lpFileInformation);
+    }
+    return FALSE;
 }
 
 void ApplyAllHooks() {
@@ -1946,31 +2520,169 @@ void ApplyAllHooks() {
         LogDebug("ApplyAllHooks: Round #" + std::to_string(s_applyCount));
     }
 
-    HookAllModulesIAT("kernel32.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
-    HookAllModulesIAT("kernelbase.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
-    HookAllModulesIAT("api-ms-win-core-libraryloader-l1-1-0.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
-    HookAllModulesIAT("api-ms-win-core-libraryloader-l1-2-0.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
-    MH_CreateHookApiEx(L"kernel32", "FindFirstFileW", &HookedFindFirstFileW, (LPVOID*)&OriginalFindFirstFileW, nullptr);
-    MH_CreateHookApiEx(L"kernel32", "FindFirstFileExW", &HookedFindFirstFileExW, (LPVOID*)&OriginalFindFirstFileExW, nullptr);
-    
-    HookAllModulesIAT("steamclient.dll", "CreateInterface", (PROC)HookedCreateInterface, (PROC*)&OriginalCreateInterface);
-    HookAllModulesIAT("steamclient64.dll", "CreateInterface", (PROC)HookedCreateInterface, (PROC*)&OriginalCreateInterface);
+    if (MH_Initialize() != MH_OK && MH_Initialize() != MH_ERROR_ALREADY_INITIALIZED) {
+        return;
+    }
 
+    if (!OriginalCreateFileW) {
+        MH_CreateHookApiEx(L"kernelbase", "CreateFileW", (LPVOID)HookedCreateFileW, (LPVOID*)&OriginalCreateFileW, nullptr);
+    }
+    if (!OriginalCreateFileA) {
+        MH_CreateHookApiEx(L"kernelbase", "CreateFileA", (LPVOID)HookedCreateFileA, (LPVOID*)&OriginalCreateFileA, nullptr);
+    }
+    if (!OriginalFindFirstFileW) {
+        MH_CreateHookApiEx(L"kernelbase", "FindFirstFileW", (LPVOID)HookedFindFirstFileW, (LPVOID*)&OriginalFindFirstFileW, nullptr);
+    }
+    if (!OriginalFindFirstFileExW) {
+        MH_CreateHookApiEx(L"kernelbase", "FindFirstFileExW", (LPVOID)HookedFindFirstFileExW, (LPVOID*)&OriginalFindFirstFileExW, nullptr);
+    }
+    if (!OriginalFindFirstFileA) {
+        MH_CreateHookApiEx(L"kernelbase", "FindFirstFileA", (LPVOID)HookedFindFirstFileA, (LPVOID*)&OriginalFindFirstFileA, nullptr);
+    }
+    if (!OriginalFindFirstFileExA) {
+        MH_CreateHookApiEx(L"kernelbase", "FindFirstFileExA", (LPVOID)HookedFindFirstFileExA, (LPVOID*)&OriginalFindFirstFileExA, nullptr);
+    }
+    if (!OriginalGetFileAttributesW) {
+        MH_CreateHookApiEx(L"kernelbase", "GetFileAttributesW", (LPVOID)HookedGetFileAttributesW, (LPVOID*)&OriginalGetFileAttributesW, nullptr);
+    }
+    if (!OriginalGetFileAttributesExW) {
+        MH_CreateHookApiEx(L"kernelbase", "GetFileAttributesExW", (LPVOID)HookedGetFileAttributesExW, (LPVOID*)&OriginalGetFileAttributesExW, nullptr);
+    }
+    if (!OriginalGetFileAttributesA) {
+        MH_CreateHookApiEx(L"kernelbase", "GetFileAttributesA", (LPVOID)HookedGetFileAttributesA, (LPVOID*)&OriginalGetFileAttributesA, nullptr);
+    }
+    if (!OriginalGetFileAttributesExA) {
+        MH_CreateHookApiEx(L"kernelbase", "GetFileAttributesExA", (LPVOID)HookedGetFileAttributesExA, (LPVOID*)&OriginalGetFileAttributesExA, nullptr);
+    }
+    HookAllModulesIAT("kernel32.dll", "GetProcAddress", (PROC)HookedGetProcAddress, (PROC*)&OriginalGetProcAddress);
     HookAllModulesIAT("kernel32.dll", "CreateProcessW", (PROC)HookedCreateProcessW, (PROC*)&OriginalCreateProcessW);
-    HookAllModulesIAT("kernel32.dll", "CreateFileW", (PROC)HookedCreateFileW, (PROC*)&OriginalCreateFileW);
-    HookAllModulesIAT("kernel32.dll", "CreateFileA", (PROC)HookedCreateFileA, (PROC*)&OriginalCreateFileA);
-    HookAllModulesIAT("kernel32.dll", "CloseHandle", (PROC)HookedCloseHandle, (PROC*)&OriginalCloseHandle);
-    HookAllModulesIAT("kernel32.dll", "MoveFileW", (PROC)HookedMoveFileW, (PROC*)&OriginalMoveFileW);
-    HookAllModulesIAT("kernel32.dll", "MoveFileExW", (PROC)HookedMoveFileExW, (PROC*)&OriginalMoveFileExW);
-    HookAllModulesIAT("kernel32.dll", "WriteFile", (PROC)HookedWriteFile, (PROC*)&OriginalWriteFile);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryW", (PROC)HookedLoadLibraryW, (PROC*)&OriginalLoadLibraryW);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryExW", (PROC)HookedLoadLibraryExW, (PROC*)&OriginalLoadLibraryExW);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryA", (PROC)HookedLoadLibraryA, (PROC*)&OriginalLoadLibraryA);
     HookAllModulesIAT("kernel32.dll", "LoadLibraryExA", (PROC)HookedLoadLibraryExA, (PROC*)&OriginalLoadLibraryExA);
+
+    HookAllModulesIAT("kernel32.dll", "MoveFileW", (PROC)HookedMoveFileW, (PROC*)&OriginalMoveFileW);
+    HookAllModulesIAT("kernel32.dll", "MoveFileExW", (PROC)HookedMoveFileExW, (PROC*)&OriginalMoveFileExW);
+    HookAllModulesIAT("kernel32.dll", "MoveFileA", (PROC)HookedMoveFileA, (PROC*)&OriginalMoveFileA);
+    HookAllModulesIAT("kernel32.dll", "MoveFileExA", (PROC)HookedMoveFileExA, (PROC*)&OriginalMoveFileExA);
+    HookAllModulesIAT("kernel32.dll", "WriteFile", (PROC)HookedWriteFile, (PROC*)&OriginalWriteFile);
+}
+
+void ClearCloudCacheForApp(uint32_t appId) {
+    try {
+        std::string activeUserId = GetActiveSteamUserId();
+        if (g_steamPath.empty() || activeUserId == "0") return;
+        fs::path steamDir = fs::path(g_steamPath);
+        fs::path appDir = steamDir / "userdata" / activeUserId / std::to_string(appId);
+        fs::path remoteCache = appDir / "remotecache.vdf";
+        std::error_code ec;
+        if (fs::exists(remoteCache, ec)) {
+            fs::remove(remoteCache, ec);
+            LogDebug("Auto-cleared remotecache.vdf for AppID " + std::to_string(appId));
+        }
+    } catch (...) {}
+}
+
+void DisableSteamCloudUIAndErrors() {
+    
 }
 
 void MainLoop() {
+
+    
+    std::thread logWatcher([]() {
+        try {
+            fs::path logPath = fs::path(g_steamPath) / "logs" / "cloud_log.txt";
+            std::ifstream logFile;
+            std::streampos lastPos = 0;
+            
+            while (g_dllRunning) {
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+                
+                std::error_code ec;
+                if (!fs::exists(logPath, ec)) continue;
+                
+                if (!logFile.is_open()) {
+                    logFile.open(logPath, std::ios::in | std::ios::ate);
+                    if (logFile.is_open()) {
+                        lastPos = logFile.tellg();
+                    }
+                } else {
+                    logFile.clear();
+                    logFile.seekg(lastPos);
+                    
+                    std::string line;
+                    while (std::getline(logFile, line)) {
+                        lastPos = logFile.tellg();
+                        
+                        if (line.find("Starting sync (up,AC Exit,)") != std::string::npos) {
+                            size_t pos = line.find("[AppID ");
+                            if (pos != std::string::npos) {
+                                size_t start = pos + 7;
+                                size_t end = line.find(']', start);
+                                if (end != std::string::npos) {
+                                    std::string idStr = line.substr(start, end - start);
+                                    try {
+                                        uint32_t appId = std::stoul(idStr);
+                                        if (IsGameTracked(appId)) {
+                                            LogDebug("LogWatcher: Detected 'Starting sync' for tracked AppID " + idStr + ". Triggering Memory Patch!");
+                                            std::thread([]() {
+                                                ApplyMemoryPatch15s();
+                                            }).detach();
+                                        }
+                                    } catch (...) {}
+                                }
+                            }
+                        }
+                        
+                        if (line.find("Upload Access Denied") != std::string::npos ||
+                            line.find("Upload complete, result Access Denied") != std::string::npos) {
+                            
+                            size_t pos = line.find("[AppID ");
+                            if (pos != std::string::npos) {
+                                size_t start = pos + 7;
+                                size_t end = line.find(']', start);
+                                if (end != std::string::npos) {
+                                    std::string idStr = line.substr(start, end - start);
+                                    try {
+                                        uint32_t appId = std::stoul(idStr);
+                                        LogDebug("LogWatcher: Detected Cloud Error for AppID " + idStr);
+                                        
+                                        
+                                        {
+                                            std::lock_guard<std::mutex> lock(g_configMutex);
+                                            if (g_patchedAppIds.find(appId) == g_patchedAppIds.end()) {
+                                                g_patchedAppIds.insert(appId);
+                                                std::ofstream os(fs::path(g_steamPath) / "patched_appids.txt", std::ios::app);
+                                                if (os) os << appId << "\n";
+                                            }
+                                        }
+                                        
+                                        
+                                        ClearCloudCacheForApp(appId);
+                                        
+                                    } catch (...) {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (...) {
+            LogDebug("logWatcher: Exception caught!");
+        }
+    });
+    logWatcher.detach();
+    
     try {
+        
+        std::string hiddenPath = std::string(g_steamPath) + "\\version_hidden.dll";
+        std::string dllPath = std::string(g_steamPath) + "\\version.dll";
+        std::error_code ec;
+        if (fs::exists(hiddenPath, ec) && !fs::exists(dllPath, ec)) {
+            rename(hiddenPath.c_str(), dllPath.c_str());
+        }
+
         LogDebug("==================================================");
         LogDebug("MainLoop: version.dll attached to process.");
         LogDebug("Build: " __DATE__ " " __TIME__);
@@ -2000,47 +2712,16 @@ void MainLoop() {
             LogDebug("MainLoop: MH_EnableHook failed!");
         }
 
-        auto userIdOpt = ReadRegistryDword(HKEY_CURRENT_USER, "SOFTWARE\\Valve\\Steam\\ActiveProcess", "ActiveUser");
-        if (userIdOpt.has_value() && *userIdOpt != 0) {
-            g_steamUserId = std::to_string(*userIdOpt);
-        } else {
-            fs::path userdataPath = steamDir / "userdata";
-            if (fs::exists(userdataPath) && fs::is_directory(userdataPath)) {
-                for (const auto& entry : fs::directory_iterator(userdataPath)) {
-                    if (entry.is_directory()) {
-                        std::string dn = entry.path().filename().string();
-                        if (!dn.empty() && dn != "0" && std::all_of(dn.begin(), dn.end(), ::isdigit)) {
-                            g_steamUserId = dn;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        LogDebug("Steam user ID: " + g_steamUserId);
+        std::string activeUserId = GetActiveSteamUserId();
+        LogDebug("Steam active user ID: " + activeUserId);
         
-        // Auto-delete remotecache.vdf for patched games to avoid manual user action
-        if (!g_steamPath.empty() && !g_steamUserId.empty() && !g_patchedAppIds.empty()) {
+        
+        if (!g_steamPath.empty() && activeUserId != "0" && !g_patchedAppIds.empty()) {
             for (uint32_t appId : g_patchedAppIds) {
-                fs::path cacheFile = fs::path(g_steamPath) / "userdata" / g_steamUserId / std::to_string(appId) / "remotecache.vdf";
-                if (fs::exists(cacheFile)) {
-                    std::error_code ec;
-                    fs::remove(cacheFile, ec);
-                    if (!ec) {
-                        LogDebug("Auto-cleared remotecache.vdf for AppID " + std::to_string(appId));
-                    }
-                }
+                ClearCloudCacheForApp(appId);
             }
         }
-        std::thread cloudDisablerThread([]() {
-            try {
-                while (g_dllRunning) {
-                    DisableSteamCloudUIAndErrors();
-                    std::this_thread::sleep_for(std::chrono::seconds(5));
-                }
-            } catch (...) {}
-        });
-        cloudDisablerThread.detach();
+        
         std::thread t([]() {
             try {
                 MonitorThread();
@@ -2083,10 +2764,29 @@ DWORD WINAPI MainLoopThread(LPVOID lpParam) {
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     switch (ul_reason_for_call) {
-    case DLL_PROCESS_ATTACH:
+    case DLL_PROCESS_ATTACH: {
         DisableThreadLibraryCalls(hModule);
-        CreateThread(nullptr, 0, MainLoopThread, nullptr, 0, nullptr);
+        char exePath[MAX_PATH];
+        GetModuleFileNameA(nullptr, exePath, MAX_PATH);
+        std::string exeName = exePath;
+        std::transform(exeName.begin(), exeName.end(), exeName.begin(), [](unsigned char c) { return (char)::tolower(c); });
+        
+        
+        
+        bool isMainSteam = false;
+        size_t len = exeName.length();
+        if (len >= 9) {
+            std::string suffix = exeName.substr(len - 9);
+            if (suffix == "steam.exe" || suffix == "\\steam.exe" || suffix == "/steam.exe") {
+                isMainSteam = true;
+            }
+        }
+        
+        if (isMainSteam) {
+            CreateThread(nullptr, 0, MainLoopThread, nullptr, 0, nullptr);
+        }
         break;
+    }
     case DLL_PROCESS_DETACH:
         g_dllRunning = false;
         TerminatePatcher();
