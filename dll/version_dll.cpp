@@ -1984,9 +1984,25 @@ inline bool IsSteamAutoCloudQuarantinePathA(LPCSTR path) {
             lower.find("\\ac\\win") != std::string::npos);
 }
 
+inline std::string WideToAnsi(const std::wstring& wstr) {
+    if (wstr.empty()) return "";
+    int size_needed = WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, NULL, 0, NULL, NULL);
+    if (size_needed <= 0) return "";
+    std::string str(size_needed - 1, 0);
+    WideCharToMultiByte(CP_ACP, 0, wstr.c_str(), -1, &str[0], size_needed, NULL, NULL);
+    return str;
+}
+
 BOOL WINAPI HookedMoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName) {
-    if (IsSteamAutoCloudQuarantinePathW(lpExistingFileName) || IsSteamAutoCloudQuarantinePathW(lpNewFileName)) {
-        LogDebug("BLOCKED MoveFileW for AutoCloud quarantine path");
+    std::wstring existingStr = lpExistingFileName ? lpExistingFileName : L"";
+    std::wstring newStr = lpNewFileName ? lpNewFileName : L"";
+    std::string existingA = WideToAnsi(existingStr);
+    std::string newA = WideToAnsi(newStr);
+    
+    bool block = IsSteamAutoCloudQuarantinePathW(lpExistingFileName) || IsSteamAutoCloudQuarantinePathW(lpNewFileName);
+    LogDebug("MoveFileW: existing=" + existingA + ", new=" + newA + ", block=" + (block ? "true" : "false"));
+    
+    if (block) {
         return TRUE;
     }
     if (OriginalMoveFileW) {
@@ -1996,8 +2012,15 @@ BOOL WINAPI HookedMoveFileW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName) {
 }
 
 BOOL WINAPI HookedMoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName, DWORD dwFlags) {
-    if (IsSteamAutoCloudQuarantinePathW(lpExistingFileName) || IsSteamAutoCloudQuarantinePathW(lpNewFileName)) {
-        LogDebug("BLOCKED MoveFileExW for AutoCloud quarantine path");
+    std::wstring existingStr = lpExistingFileName ? lpExistingFileName : L"";
+    std::wstring newStr = lpNewFileName ? lpNewFileName : L"";
+    std::string existingA = WideToAnsi(existingStr);
+    std::string newA = WideToAnsi(newStr);
+    
+    bool block = IsSteamAutoCloudQuarantinePathW(lpExistingFileName) || IsSteamAutoCloudQuarantinePathW(lpNewFileName);
+    LogDebug("MoveFileExW: existing=" + existingA + ", new=" + newA + ", flags=" + std::to_string(dwFlags) + ", block=" + (block ? "true" : "false"));
+    
+    if (block) {
         return TRUE;
     }
     if (OriginalMoveFileExW) {
@@ -2007,8 +2030,13 @@ BOOL WINAPI HookedMoveFileExW(LPCWSTR lpExistingFileName, LPCWSTR lpNewFileName,
 }
 
 BOOL WINAPI HookedMoveFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName) {
-    if (IsSteamAutoCloudQuarantinePathA(lpExistingFileName) || IsSteamAutoCloudQuarantinePathA(lpNewFileName)) {
-        LogDebug("BLOCKED MoveFileA for AutoCloud quarantine path");
+    std::string existingA = lpExistingFileName ? lpExistingFileName : "";
+    std::string newA = lpNewFileName ? lpNewFileName : "";
+    
+    bool block = IsSteamAutoCloudQuarantinePathA(lpExistingFileName) || IsSteamAutoCloudQuarantinePathA(lpNewFileName);
+    LogDebug("MoveFileA: existing=" + existingA + ", new=" + newA + ", block=" + (block ? "true" : "false"));
+    
+    if (block) {
         return TRUE;
     }
     if (OriginalMoveFileA) {
@@ -2018,8 +2046,13 @@ BOOL WINAPI HookedMoveFileA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName) {
 }
 
 BOOL WINAPI HookedMoveFileExA(LPCSTR lpExistingFileName, LPCSTR lpNewFileName, DWORD dwFlags) {
-    if (IsSteamAutoCloudQuarantinePathA(lpExistingFileName) || IsSteamAutoCloudQuarantinePathA(lpNewFileName)) {
-        LogDebug("BLOCKED MoveFileExA for AutoCloud quarantine path");
+    std::string existingA = lpExistingFileName ? lpExistingFileName : "";
+    std::string newA = lpNewFileName ? lpNewFileName : "";
+    
+    bool block = IsSteamAutoCloudQuarantinePathA(lpExistingFileName) || IsSteamAutoCloudQuarantinePathA(lpNewFileName);
+    LogDebug("MoveFileExA: existing=" + existingA + ", new=" + newA + ", flags=" + std::to_string(dwFlags) + ", block=" + (block ? "true" : "false"));
+    
+    if (block) {
         return TRUE;
     }
     if (OriginalMoveFileExA) {
